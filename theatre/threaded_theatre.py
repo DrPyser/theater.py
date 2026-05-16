@@ -25,7 +25,6 @@ class RequestCancelledError(Exception):
     def __init__(self, req):
         self.req = req
 
-
 ActorAddr = NewType("ActorAddr", int)
 
 
@@ -64,6 +63,10 @@ ActorState = Init | Pending | Executing | Terminated
 
 def has_active_actors(states: dict) -> bool:
     return any(not isinstance(s, Terminated) for s in states.values())
+
+class DestinationNotFound(Exception):
+    def __init__(self, destination: ActorAddr):
+        self.destination = destination
 
 
 class Theatre:
@@ -169,10 +172,12 @@ class Theatre:
                                     request=req, response_future=resp_future
                                 )
                             case send(dest_addr, msg):
-                                destination = actors[dest_addr]
-                                destination.mailbox.put(msg)
                                 resp_future = Future()
-                                resp_future.set_result(None)
+                                if destination := actors.get(dest_addr):
+                                    destination.mailbox.put(msg)
+                                    resp_future.set_result(None)
+                                else:
+                                    resp_future.set_exception(DestinationNotFound(dest_addr))
                                 states[addr] = Pending(
                                     request=req, response_future=resp_future
                                 )

@@ -1,5 +1,5 @@
 import pytest
-from theatre.threaded_theatre import Theatre, receive, spawn, send
+from theatre.threaded_theatre import Theatre, receive, spawn, send, DestinationNotFound
 
 
 def test_theatre_run():
@@ -107,4 +107,36 @@ def test_theatre_run_multiple_actors_terminated():
     with Theatre(clock_tick=0.01) as theatre:
         result = theatre.run(main_actor)
         assert result == "all_done"
+
+
+def test_send_to_terminated_actor_raises():
+    def target_actor(*args):
+        yield Theatre.exit("target_done")
+
+    def sender(*args):
+        doomed = yield spawn(target_actor)
+        yield Theatre.sleep(0.005)
+        yield send(doomed, "test")
+
+    with Theatre() as theatre:
+        with pytest.raises(DestinationNotFound):
+            result = theatre.run(sender)
+
+
+def test_send_to_terminated_actor_caught():
+    def target_actor(*args):
+        yield Theatre.exit("target_done")
+
+    def sender(*args):
+        doomed = yield spawn(target_actor)
+        yield Theatre.sleep(0.01)
+        try:
+            yield send(doomed, "test")
+        except DestinationNotFound:
+            pass
+        yield Theatre.exit("sender_success")
+
+    with Theatre() as theatre:
+        result = theatre.run(sender)
+        assert result == "sender_success"
 
