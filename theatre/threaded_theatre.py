@@ -1,5 +1,6 @@
 from theatre.interfaces import receive, Actor, Exit, ActorSheet, send, spawn
-from concurrent.futures import ThreadPoolExecutor, Future, as_completed
+import threading
+from concurrent.futures import ThreadPoolExecutor, Future, as_completed, CancelledError
 import itertools
 from queue import Queue
 from collections import deque
@@ -21,7 +22,7 @@ def create_actor_sheet(actor_script, props, addr, mailbox):
     )
 
 
-class RequestCancelledError(Exception):
+class RequestCancelled(Exception):
     def __init__(self, req):
         self.req = req
 
@@ -69,6 +70,16 @@ class DestinationNotFound(Exception):
         self.destination = destination
 
 
+class ActorCancelled(Exception):
+    def __init__(self, actor: ActorAddr):
+        self.actor = actor
+
+
+def curtain_call(**kwargs):
+    kwargs.setdefault("executor", ThreadPoolExecutor())
+    return Theatre(**kwargs)
+
+
 class Theatre:
     @dataclass
     class self:
@@ -82,10 +93,10 @@ class Theatre:
     class exit:
         value: Any = None
 
-    def __init__(self, queue_size=1024, clock_tick=0.0):
+    def __init__(self, executor: Executor, queue_size=1024, clock_tick=0.0):
         self._counter = itertools.count()
         self.queue_size = queue_size
-        self.threadpool = ThreadPoolExecutor()
+        self.executor = executor
         self.clock_tick = clock_tick
 
     def make_addr(self, script, props) -> ActorAddr:
@@ -96,7 +107,7 @@ class Theatre:
         return self
 
     def __exit__(self, exc, typ, tb):
-        self.threadpool.shutdown(cancel_futures=True)
+        self.executor.shutdown(cancel_futures=True)
 
     def _create_actor(self, script, props):
         addr = self.make_addr(script, props)
@@ -113,7 +124,7 @@ class Theatre:
         actors: dict[ActorAddr, ActorSheet] = {main_sheet.address: main_sheet}
         states: dict[ActorAddr, ActorState] = {
             main_sheet.address: Init(
-                future=self.threadpool.submit(main_sheet.play.send, None)
+                future=self.executor.submit(main_sheet.play.send, None)
             )
         }
         exit_value = None
@@ -123,6 +134,8 @@ class Theatre:
         while states:
             cnt = next(loop_count)
             print(f"Running main loop ({cnt})")
+            print(f"{len(states)} actors on stage")
+            print(f"{threading.active_count()} active threads")
             for addr in list(states.keys()):
                 state = states[addr]
                 sheet = actors[addr]
@@ -136,6 +149,11 @@ class Theatre:
                             print(
                                 f"actor {addr} terminated during init with value {ex.value}"
                             )
+                        except CancelledError as ex:
+                            print(f"actor {addr} cancelled during init")
+                            wrap = ActorCancelled(addr)
+                            wrap.__cause__ = wrap.__context__ = ex
+                            states[addr] = Terminated(error=wrap)
                         except Exception as ex:
                             states[addr] = Terminated(error=ex)
                             print(f"actor {addr} died during init: {ex}")
@@ -156,7 +174,7 @@ class Theatre:
                                 new_sheet = self._create_actor(script, props)
                                 actors[new_sheet.address] = new_sheet
                                 states[new_sheet.address] = Init(
-                                    future=self.threadpool.submit(
+                                    future=self.executor.submit(
                                         new_sheet.play.send, None
                                     )
                                 )
@@ -182,21 +200,21 @@ class Theatre:
                                     request=req, response_future=resp_future
                                 )
                             case receive():
-                                resp_future = self.threadpool.submit(sheet.mailbox.get)
+                                resp_future = self.executor.submit(sheet.mailbox.get)
                                 states[addr] = Pending(
                                     request=req, response_future=resp_future
                                 )
                             case Theatre.sleep(n):
                                 def delayed():
                                     time.sleep(n)
-                                resp_future = self.threadpool.submit(delayed)
+                                resp_future = self.executor.submit(delayed)
                                 states[addr] = Pending(
                                     request=req, response_future=resp_future
                                 )
                             case _:
                                 print(f"unexpected request {req}")
                                 states[addr] = Executing(
-                                    future=self.threadpool.submit(
+                                    future=self.executor.submit(
                                         sheet.play.throw, ValueError(req)
                                     )
                                 )
@@ -207,17 +225,17 @@ class Theatre:
                         print(f"actor({addr}) request({req}) response ready")
                         if fut.cancelled():
                             print(f"actor({addr}) request({req}) cancelled")
-                            exec_future = self.threadpool.submit(
-                                sheet.play.throw, RequestCancelledError(req)
+                            exec_future = self.executor.submit(
+                                sheet.play.throw, RequestCancelled(req)
                             )
                         elif exception := fut.exception():
                             print(f"actor({addr}) request({req}) failed: {exception}")
-                            exec_future = self.threadpool.submit(
+                            exec_future = self.executor.submit(
                                 sheet.play.throw, exception
                             )
                         else:
                             print(f"actor({addr}) request({req}) succeeded")
-                            exec_future = self.threadpool.submit(
+                            exec_future = self.executor.submit(
                                 sheet.play.send, fut.result()
                             )
 
