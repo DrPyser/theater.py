@@ -108,5 +108,4 @@ class ActorSheet(Generic[PropsT]):
     play: Coroutine
     props: PropsT
     mailbox: Inbox
-    outbox: Outbox
     context: Context

@@ -18,7 +18,6 @@ def create_actor_sheet(actor_script, props, addr, mailbox):
         play=actor_script(*props),
         props=props,
         mailbox=mailbox(),
-        outbox=mailbox(),
         context=copy_context(),
     )
 
