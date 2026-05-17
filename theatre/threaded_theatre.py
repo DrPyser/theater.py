@@ -174,6 +174,24 @@ class Theatre:
     def __exit__(self, exc, typ, tb):
         self.executor.shutdown(cancel_futures=True)
 
+    def _submit_performance(self, addr, fn, *args):
+        print(f"submitting performance for actor {addr}: {fn.__qualname__}({args!r})")
+        fut = self.executor.submit(fn, *args)
+        fut.add_done_callback(
+            lambda f: self._events.put(EndOfScene(actor=addr, future=f))
+        )
+        return fut
+
+    def _submit_request(self, addr, request, fn, *args):
+        print(f"submitting request for actor {addr}: {request!r} ({fn.__qualname__})")
+        fut = self.executor.submit(fn, *args)
+        fut.add_done_callback(
+            lambda f: self._events.put(
+                RequestCompleted(actor=addr, request=request, future=f)
+            )
+        )
+        return fut
+
     def _create_actor(self, script, props):
         addr = self.make_addr(script, props)
         mailbox = lambda: queue.Queue(self.queue_size)
@@ -184,10 +202,6 @@ class Theatre:
         print(f"handling request: actor({addr}), request({request})")
         sheet = play.actors[addr]
 
-        def request_done_callback(fut):
-            print(f"Request task completed for actor {addr} {request=} {fut=}")
-            self._events.put(RequestCompleted(actor=addr, request=request, future=fut))
-
         match request:
             case Theatre.exit(value):
                 print(f"actor({addr}) terminated with value {value}")
@@ -196,13 +210,9 @@ class Theatre:
             case spawn(script, props):
                 new_sheet = self._create_actor(script, props)
                 play.actors[new_sheet.address] = new_sheet
-
-                def init_callback(fut):
-                    print(f"actor {new_sheet.address} done initializing {fut=}")
-                    self._events.put(EndOfScene(actor=new_sheet.address, future=fut))
-
-                future = self.executor.submit(new_sheet.play.send, None)
-                future.add_done_callback(init_callback)
+                future = self._submit_performance(
+                    new_sheet.address, new_sheet.play.send, None
+                )
                 play.states[new_sheet.address] = Init(future=future)
                 resp_future = Future()
                 resp_future.set_result(new_sheet.address)
@@ -226,8 +236,7 @@ class Theatre:
                     request=request, response_future=resp_future
                 )
             case receive():
-                resp_future = self.executor.submit(sheet.mailbox.get)
-                resp_future.add_done_callback(request_done_callback)
+                resp_future = self._submit_request(addr, request, sheet.mailbox.get)
                 play.states[addr] = Pending(
                     request=request, response_future=resp_future
                 )
@@ -236,22 +245,15 @@ class Theatre:
                 def delayed():
                     time.sleep(n)
 
-                resp_future = self.executor.submit(delayed)
-                resp_future.add_done_callback(request_done_callback)
+                resp_future = self._submit_request(addr, request, delayed)
                 play.states[addr] = Pending(
                     request=request, response_future=resp_future
                 )
             case _:
                 print(f"unexpected request {request}")
-                future = self.executor.submit(
-                    sheet.play.throw, UnsupportedRequest(addr, request)
+                future = self._submit_performance(
+                    addr, sheet.play.throw, UnsupportedRequest(addr, request)
                 )
-
-                def done_callback(fut):
-                    print(f"end of scene for actor {addr}, {future=}")
-                    self._events.put(EndOfScene(actor=addr, future=fut))
-
-                future.add_done_callback(done_callback)
                 play.states[addr] = Executing(future=future)
 
     def _process_state(self, addr: ActorAddr, play: Play) -> bool:
@@ -290,21 +292,20 @@ class Theatre:
                 print(f"actor({addr}) request({req}) response ready")
                 if fut.cancelled():
                     print(f"actor({addr}) request({req}) cancelled")
-                    exec_future = self.executor.submit(
-                        sheet.play.throw, RequestCancelled(req)
+                    exec_future = self._submit_performance(
+                        addr, sheet.play.throw, RequestCancelled(req)
                     )
                 elif exception := fut.exception():
                     print(f"actor({addr}) request({req}) failed: {exception}")
-                    exec_future = self.executor.submit(sheet.play.throw, exception)
+                    exec_future = self._submit_performance(
+                        addr, sheet.play.throw, exception
+                    )
                 else:
                     print(f"actor({addr}) request({req}) succeeded")
-                    exec_future = self.executor.submit(sheet.play.send, fut.result())
+                    exec_future = self._submit_performance(
+                        addr, sheet.play.send, fut.result()
+                    )
 
-                def done_callback(done_future):
-                    print(f"end of scene for actor {addr}, {done_future=}")
-                    self._events.put(EndOfScene(actor=addr, future=done_future))
-
-                exec_future.add_done_callback(done_callback)
                 play.states[addr] = Executing(future=exec_future)
                 return True
 
@@ -405,15 +406,12 @@ class Theatre:
         # Explicit state wrappers:
         # Init -> Pending(req) -> Executing -> Terminated
         actors: dict[ActorAddr, ActorSheet] = {main_sheet.address: main_sheet}
-        protagonist_init_future = self.executor.submit(main_sheet.play.send, None)
-
-        def init_callback(fut):
-            print(f"protagonist done initializing {fut=}")
-            self._events.put(EndOfScene(actor=main_sheet.address, future=fut))
-
-        protagonist_init_future.add_done_callback(init_callback)
         states: dict[ActorAddr, ActorState] = {
-            main_sheet.address: Init(future=protagonist_init_future)
+            main_sheet.address: Init(
+                future=self._submit_performance(
+                    main_sheet.address, main_sheet.play.send, None
+                )
+            )
         }
 
         play = Play(states=states, actors=actors, protagonist=main_sheet.address)
