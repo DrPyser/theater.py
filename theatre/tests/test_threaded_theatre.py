@@ -9,6 +9,7 @@ from theatre.threaded_theatre import (
     curtain_call,
     RequestCancelled,
     ActorCancelled,
+    UnsupportedRequest
 )
 
 
@@ -57,6 +58,19 @@ def test_theatre_run_actor_spawn():
         assert msg == "mom"
 
     with curtain_call(clock_tick=0.0) as theatre:
+        theatre.run(main_actor)
+
+
+def test_theatre_run_actor_unsupported_request():
+    from dataclasses import dataclass
+    @dataclass
+    class strange_request:
+        pass
+    def main_actor(*args):
+        with pytest.raises(UnsupportedRequest):
+            yield strange_request()
+
+    with curtain_call() as theatre:
         theatre.run(main_actor)
 
 
@@ -150,6 +164,26 @@ def test_send_to_terminated_actor_caught():
         assert result == "sender_success"
 
 
+def test_run_actor_dies_during_init():
+    def protagonist(*args):
+        raise Exception()
+        yield Theatre.exit("sender_success")
+
+    with curtain_call() as theatre:
+        with pytest.raises(Exception):
+            result = theatre.run(protagonist)
+
+
+def test_run_actor_returns_during_init():
+    def protagonist(*args):
+        return 0
+        yield Theatre.exit("sender_success")
+
+    with curtain_call() as theatre:
+        result = theatre.run(protagonist)
+        assert result == 0
+
+
 def test_cancelled_init():
     from unittest.mock import create_autospec
 
@@ -195,6 +229,7 @@ def test_cancelled_request():
     with Theatre(CancellingExecutor()) as theatre:
         result = theatre.run(main_actor)
         assert result == "cancelled_ok"
+
 
 
 # def test_threadpool_exhaustion():

@@ -75,6 +75,12 @@ class ActorCancelled(Exception):
         self.actor = actor
 
 
+class UnsupportedRequest(Exception):
+    def __init__(self, actor: ActorAddr, req: Any):
+        self.actor = actor
+        self.request = req
+
+
 def curtain_call(**kwargs):
     kwargs.setdefault("executor", ThreadPoolExecutor())
     return Theatre(**kwargs)
@@ -215,7 +221,7 @@ class Theatre:
                                 print(f"unexpected request {req}")
                                 states[addr] = Executing(
                                     future=self.executor.submit(
-                                        sheet.play.throw, ValueError(req)
+                                        sheet.play.throw, UnsupportedRequest(addr, req)
                                     )
                                 )
 
