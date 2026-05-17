@@ -9,8 +9,29 @@ from theatre.threaded_theatre import (
     curtain_call,
     RequestCancelled,
     ActorCancelled,
-    UnsupportedRequest
+    UnsupportedRequest,
+    drain,
+    ErrorExit
 )
+import queue
+
+
+def test_drain_empty_queue():
+    q = queue.Queue()
+    assert list(drain(q, timeout=0.0)) == []
+
+
+def test_drain_non_empty_queue():
+    q = queue.Queue()
+    q.put_nowait(1)
+    assert list(drain(q)) == [1]
+
+
+def test_drain_multiple_items():
+    q = queue.Queue()
+    for i in range(10):
+        q.put_nowait(i)
+    assert list(drain(q)) == list(range(10))
 
 
 def test_theatre_run():
@@ -111,9 +132,9 @@ def test_theatre_run_actor_terminated_with_error():
         yield Theatre.exit()
 
     with curtain_call() as theatre:
-        with pytest.raises(Exception) as ex:
+        with pytest.raises(ErrorExit) as ex:
             theatre.run(failing_actor)
-        assert ex.value.args == ("Forgot my lines",)
+        assert ex.value.cause.args == ("Forgot my lines",)
 
 
 def test_theatre_run_multiple_actors_terminated():
@@ -142,8 +163,10 @@ def test_send_to_terminated_actor_raises():
         yield send(doomed, "test")
 
     with curtain_call() as theatre:
-        with pytest.raises(DestinationNotFound):
+        with pytest.raises(ErrorExit) as exc:
             result = theatre.run(sender)
+
+        assert isinstance(exc.value.cause, DestinationNotFound)
 
 
 def test_send_to_terminated_actor_caught():
@@ -196,8 +219,10 @@ def test_cancelled_init():
         yield Theatre.self()
 
     with Theatre(mock_executor) as theatre:
-        with pytest.raises(ActorCancelled):
+        with pytest.raises(ErrorExit) as exc:
             theatre.run(main_actor)
+
+        assert isinstance(exc.value.cause, ActorCancelled)
 
 
 def test_cancelled_request():
