@@ -1,7 +1,13 @@
 from theatre.interfaces import receive, Actor, Exit, ActorSheet, send, spawn
 import threading
 import queue
-from concurrent.futures import ThreadPoolExecutor, Future, as_completed, CancelledError
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    Future,
+    as_completed,
+    CancelledError,
+    Executor,
+)
 import itertools
 from collections import deque
 from collections.abc import Iterator
@@ -38,11 +44,18 @@ class Init:
 
 
 @dataclass
-class Pending:
-    """Actor yielded a request, waiting for it to be handled"""
+class Waiting:
+    """Actor yielded a request, not yet dispatched"""
 
     request: object
-    response_future: Future | None = None  # None = not yet handled
+
+
+@dataclass
+class Awaiting:
+    """Request dispatched, waiting for response_future to complete"""
+
+    request: object
+    response_future: Future
 
 
 @dataclass
@@ -60,7 +73,12 @@ class Terminated:
     error: Exception | None = None
 
 
-ActorState = Init | Pending | Executing | Terminated
+@dataclass
+class Receiving:
+    """Actor waiting for a message in mailbox"""
+
+
+ActorState = Init | Waiting | Awaiting | Executing | Receiving | Terminated
 
 
 class Event:
@@ -83,8 +101,14 @@ class EndOfScene(ActorEvent):
     future: Future
 
 
-def has_active_actors(states: dict) -> bool:
-    return any(not isinstance(s, Terminated) for s in states.values())
+@dataclass
+class MessageDelivered(ActorEvent):
+    pass
+
+
+class Stop(Exception):
+    def __init__(self):
+        super().__init__("Stopping play")
 
 
 class DestinationNotFound(Exception):
@@ -163,6 +187,10 @@ class Theatre:
         self.clock_tick = clock_tick
         self._events = queue.Queue()
 
+        # set when starting run loop
+        self._play = None
+        self._thread = None
+
     def make_addr(self, script, props) -> ActorAddr:
         addr = hash((script, props, next(self._counter)))
         return ActorAddr(addr)
@@ -171,7 +199,13 @@ class Theatre:
         return self
 
     def __exit__(self, exc, typ, tb):
+        self.stop()
+        if self._thread and self._thread.is_alive():
+            self._thread.join()
         self.executor.shutdown(cancel_futures=True)
+
+    def stop(self):
+        self._events.put(Stop())
 
     def _submit_performance(self, addr, fn, *args):
         print(f"submitting performance for actor {addr}: {fn.__qualname__}({args!r})")
@@ -215,37 +249,44 @@ class Theatre:
                 play.states[new_sheet.address] = Init(future=future)
                 resp_future = Future()
                 resp_future.set_result(new_sheet.address)
-                play.states[addr] = Pending(
+                play.states[addr] = Awaiting(
                     request=request, response_future=resp_future
                 )
             case Theatre.self():
                 resp_future = Future()
                 resp_future.set_result(addr)
-                play.states[addr] = Pending(
+                play.states[addr] = Awaiting(
                     request=request, response_future=resp_future
                 )
             case send(dest_addr, msg):
                 resp_future = Future()
                 if destination := play.actors.get(dest_addr):
                     destination.mailbox.put(msg)
+                    self._events.put(MessageDelivered(actor=dest_addr))
                     resp_future.set_result(None)
                 else:
                     resp_future.set_exception(DestinationNotFound(dest_addr))
-                play.states[addr] = Pending(
+                play.states[addr] = Awaiting(
                     request=request, response_future=resp_future
                 )
             case receive():
-                resp_future = self._submit_request(addr, request, sheet.mailbox.get)
-                play.states[addr] = Pending(
-                    request=request, response_future=resp_future
-                )
+                try:
+                    msg = sheet.mailbox.get_nowait()
+                except queue.Empty:
+                    play.states[addr] = Receiving()
+                else:
+                    resp_future = Future()
+                    resp_future.set_result(msg)
+                    play.states[addr] = Awaiting(
+                        request=request, response_future=resp_future
+                    )
             case Theatre.sleep(n):
 
                 def delayed():
                     time.sleep(n)
 
                 resp_future = self._submit_request(addr, request, delayed)
-                play.states[addr] = Pending(
+                play.states[addr] = Awaiting(
                     request=request, response_future=resp_future
                 )
             case _:
@@ -277,17 +318,15 @@ class Theatre:
                     play.states[addr] = Terminated(error=ex)
                     print(f"actor {addr} died during init: {ex}")
                 else:
-                    play.states[addr] = Pending(request=req)
+                    play.states[addr] = Waiting(request=req)
                     print(f"actor {addr} initialized, pending request {req}")
                 return True
 
-            case Pending(request=req, response_future=None):
+            case Waiting(request=req):
                 self._handle_request(addr, req, play)
                 return True
 
-            case Pending(request=req, response_future=fut) if (
-                fut is not None and fut.done()
-            ):
+            case Awaiting(request=req, response_future=fut) if fut.done():
                 print(f"actor({addr}) request({req}) response ready")
                 if fut.cancelled():
                     print(f"actor({addr}) request({req}) cancelled")
@@ -318,12 +357,15 @@ class Theatre:
                     play.states[addr] = Terminated(error=ex)
                     print(f"actor {addr} died: {ex}")
                 else:
-                    play.states[addr] = Pending(request=req)
+                    play.states[addr] = Waiting(request=req)
                     print(f"actor {addr} now pending request {req}")
                 return True
 
             case Executing(future=fut):
                 print(f"actor({addr}) still executing (future {fut})")
+                return False
+
+            case Receiving():
                 return False
 
             case Terminated(result=result, error=error):
@@ -361,6 +403,12 @@ class Theatre:
     def _handle_event(self, event: Event, play: Play) -> None:
         print(f"Handling event {event}")
         match event:
+            case Stop():
+                # received stop signal
+                # for graceful shutdown: cancel any pending future,
+                # transition all actors state to Terminated?
+                print("Pulled Stop event from queue")
+                raise event
             case EndOfScene(actor=actor, future=future):
                 if actor not in play.states:
                     print(f"Stale event: actor {actor} gone")
@@ -386,7 +434,7 @@ class Theatre:
                     return
                 actor_state = play.states[actor]
                 match actor_state:
-                    case Pending(request=req, response_future=fut):
+                    case Awaiting(request=req, response_future=fut):
                         assert future.done()
                         if req is not request or fut is not future:
                             print(
@@ -398,12 +446,64 @@ class Theatre:
                             f"Stale event: actor {actor} has unexpected state {state}"
                         )
 
-    def run(self, main_actor, *args):
-        main_props = args
-        main_sheet = self._create_actor(main_actor, main_props)
+            case MessageDelivered(actor=actor):
+                if actor not in play.states:
+                    print(f"Stale event: actor {actor} gone")
+                    return
+                actor_state = play.states[actor]
+                match actor_state:
+                    case Receiving():
+                        sheet = play.actors[actor]
+                        msg = sheet.mailbox.get_nowait()
+                        resp_future = Future()
+                        resp_future.set_result(msg)
+                        play.states[actor] = Awaiting(
+                            request=receive(), response_future=resp_future
+                        )
+                        self._chain_transitions(actor, play)
+                    case _:
+                        pass
+
+    def _run_loop(self):
+        try:
+            assert self._play
+
+            loop_count = itertools.count()
+            stop = False
+            while self._play.states and not stop:
+                cnt = next(loop_count)
+                print(f"Running main loop ({cnt})")
+                print(f"{len(self._play.states)} actors on stage")
+                print(f"{threading.active_count()} active threads")
+
+                events = list(drain(self._events, timeout=self.clock_tick))
+                if not events:
+                    print(f"({cnt}) No events in last cycle ({self.clock_tick}s)")
+                    continue
+
+                print(f"{len(events)} events to handle")
+                for event in events:
+                    try:
+                        self._handle_event(event, self._play)
+                    except Stop:
+                        print(
+                            f"({loop_count}) Stop exception raised, terminating event loop"
+                        )
+                        stop = True
+                        break
+                    print(f"Handled event {event}")
+
+            print(f"Terminating play: {stop=} {self._play.exit=}")
+        except BaseException as ex:
+            print(f"Theatre run loop raised exception: {ex}")
+            raise
+
+    def run(self, protagonist: Actor, *props):
+        main_props = props
+        main_sheet = self._create_actor(protagonist, main_props)
 
         # Explicit state wrappers:
-        # Init -> Pending(req) -> Executing -> Terminated
+        # Init -> Waiting -> Awaiting/Receiving -> Executing -> Terminated
         actors: dict[ActorAddr, ActorSheet] = {main_sheet.address: main_sheet}
         states: dict[ActorAddr, ActorState] = {
             main_sheet.address: Init(
@@ -413,30 +513,16 @@ class Theatre:
             )
         }
 
-        play = Play(states=states, actors=actors, protagonist=main_sheet.address)
-
-        loop_count = itertools.count()
-        while states:
-            cnt = next(loop_count)
-            print(f"Running main loop ({cnt})")
-            print(f"{len(states)} actors on stage")
-            print(f"{threading.active_count()} active threads")
-
-            events = list(drain(self._events, timeout=self.clock_tick))
-            if not events:
-                print(f"({cnt}) No events in last cycle ({self.clock_tick}s)")
-                continue
-
-            print(f"{len(events)} events to handle")
-            for event in events:
-                self._handle_event(event, play)
-                print(f"Handled event {event}")
-
-        print(f"Terminating play: {play.exit=}")
-
-        match play.exit:
+        self._play = Play(states=states, actors=actors, protagonist=main_sheet.address)
+        self._thread = threading.Thread(
+            name=f"theatre-{id(self)}", target=self._run_loop
+        )
+        self._thread.start()
+        self._thread.join()
+        print("Run loop thread terminated")
+        match self._play.exit:
             case ErrorExit():
-                raise play.exit
+                raise self._play.exit
             case NormalExit(value=value):
                 return value
             case None:
