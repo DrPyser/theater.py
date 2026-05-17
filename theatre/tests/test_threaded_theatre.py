@@ -78,15 +78,17 @@ def test_theatre_run_actor_spawn():
         msg = yield receive()
         assert msg == "mom"
 
-    with curtain_call(clock_tick=0.15) as theatre:
+    with curtain_call() as theatre:
         theatre.run(main_actor)
 
 
 def test_theatre_run_actor_unsupported_request():
     from dataclasses import dataclass
+
     @dataclass
     class strange_request:
         pass
+
     def main_actor(*args):
         with pytest.raises(UnsupportedRequest):
             yield strange_request()
@@ -148,7 +150,7 @@ def test_theatre_run_multiple_actors_terminated():
         w2 = yield spawn(worker, ("w2",))
         yield Theatre.exit("all_done")
 
-    with curtain_call(clock_tick=0.15) as theatre:
+    with curtain_call() as theatre:
         result = theatre.run(main_actor)
         assert result == "all_done"
 

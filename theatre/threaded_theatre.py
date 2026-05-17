@@ -156,7 +156,7 @@ class Theatre:
     class exit:
         value: Any = None
 
-    def __init__(self, executor: Executor, queue_size=1024, clock_tick=0.15):
+    def __init__(self, executor: Executor, queue_size=1024, clock_tick=1):
         self._counter = itertools.count()
         self.queue_size = queue_size
         self.executor = executor
