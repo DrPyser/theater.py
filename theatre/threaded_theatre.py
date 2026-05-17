@@ -78,6 +78,11 @@ class RequestCompleted(ActorEvent):
     future: Future
 
 
+@dataclass
+class EndOfScene(ActorEvent):
+    future: Future
+
+
 def has_active_actors(states: dict) -> bool:
     return any(not isinstance(s, Terminated) for s in states.values())
 
@@ -132,8 +137,8 @@ class ErrorExit(Exception):
 
 @dataclass
 class Play:
-    states: list[ActorState]
-    actors: list[ActorSheet]
+    states: dict[ActorAddr, ActorState]
+    actors: dict[ActorAddr, ActorSheet]
     protagonist: ActorAddr
     exit: ErrorExit | NormalExit | None = None
 
@@ -151,7 +156,7 @@ class Theatre:
     class exit:
         value: Any = None
 
-    def __init__(self, executor: Executor, queue_size=1024, clock_tick=0.0):
+    def __init__(self, executor: Executor, queue_size=1024, clock_tick=0.15):
         self._counter = itertools.count()
         self.queue_size = queue_size
         self.executor = executor
@@ -177,6 +182,14 @@ class Theatre:
     def _handle_request(self, addr, request, play: Play):
         print(f"handling request: actor({addr}), request({request})")
         sheet = play.actors[addr]
+        def request_done_callback(fut):
+            print(f"Request task completed for actor {addr} {request=} {fut=}")
+            self._events.put(RequestCompleted(
+                actor=addr,
+                request=request,
+                future=fut
+            ))
+
         match request:
             case Theatre.exit(value):
                 print(f"actor({addr}) terminated with value {value}")
@@ -187,10 +200,18 @@ class Theatre:
             case spawn(script, props):
                 new_sheet = self._create_actor(script, props)
                 play.actors[new_sheet.address] = new_sheet
+                def init_callback(fut):
+                    print(f"actor {new_sheet.address} done initializing {fut=}")
+                    self._events.put(EndOfScene(
+                        actor=new_sheet.address,
+                        future=fut
+                    ))
+                future = self.executor.submit(
+                    new_sheet.play.send, None
+                )
+                future.add_done_callback(init_callback)
                 play.states[new_sheet.address] = Init(
-                    future=self.executor.submit(
-                        new_sheet.play.send, None
-                    )
+                    future=future
                 )
                 resp_future = Future()
                 resp_future.set_result(new_sheet.address)
@@ -215,6 +236,7 @@ class Theatre:
                 )
             case receive():
                 resp_future = self.executor.submit(sheet.mailbox.get)
+                resp_future.add_done_callback(request_done_callback)
                 play.states[addr] = Pending(
                     request=request, response_future=resp_future
                 )
@@ -222,15 +244,24 @@ class Theatre:
                 def delayed():
                     time.sleep(n)
                 resp_future = self.executor.submit(delayed)
+                resp_future.add_done_callback(request_done_callback)
                 play.states[addr] = Pending(
                     request=request, response_future=resp_future
                 )
             case _:
                 print(f"unexpected request {request}")
+                future = self.executor.submit(
+                    sheet.play.throw, UnsupportedRequest(addr, request)
+                )
+                def done_callback(fut):
+                    print(f"end of scene for actor {addr}, {future=}")
+                    self._events.put(EndOfScene(
+                        actor=addr,
+                        future=fut
+                    ))
+                future.add_done_callback(done_callback)
                 play.states[addr] = Executing(
-                    future=self.executor.submit(
-                        sheet.play.throw, UnsupportedRequest(addr, request)
-                    )
+                    future=future
                 )
 
         return play
@@ -283,8 +314,12 @@ class Theatre:
                         sheet.play.send, fut.result()
                     )
 
-                def done_callback(fut):
-                    print(f"future {fut} done")
+                def done_callback(done_future):
+                    print(f"end of scene for actor {addr}, {done_future=}")
+                    self._events.put(EndOfScene(
+                        actor=addr,
+                        future=done_future
+                    ))
 
                 exec_future.add_done_callback(done_callback)
                 play.states[addr] = Executing(future=exec_future)
@@ -295,11 +330,6 @@ class Theatre:
                 except StopIteration as ex:
                     play.states[addr] = Terminated(result=ex.value)
                     print(f"actor {addr} terminated with value {ex.value}")
-                    if addr == play.protagonist:
-                        print(
-                            f"Main actor terminated, capturing exit value: {ex.value}"
-                        )
-                        exit_value = ex.value
                 except Exception as ex:
                     play.states[addr] = Terminated(error=ex)
                     print(f"actor {addr} died: {ex}")
@@ -325,6 +355,58 @@ class Theatre:
                 play.actors.pop(addr)
         return play
 
+    def _chain_transitions(self, actor: ActorAddr, play: Play) -> Play:
+        state = play.states[actor]
+        print(f"Chaining transitions for actor {actor} from state {state} ")
+        while play := self._process_state(actor, play):
+            if actor not in play.states:
+                print(f"State of actor {actor} disappeared during transition")
+                break
+            if play.states[actor] == state:
+                # reached a blocked state, need to wait for event
+                print(f"Reached steady state {state} for actor {actor}")
+                break
+            print(f"Transitioned actor {actor}: {state} -> {play.states[actor]}")
+            state = play.states[actor]
+        return play
+
+    def _handle_event(self, event: Event, play: Play) -> Play:
+        print(f"Handling event {event}")
+        match event:
+            case EndOfScene(actor=actor, future=future):
+                if actor not in play.states:
+                    print(f"Stale event: actor {actor} gone")
+                    return play
+                actor_state = play.states[actor]
+                match actor_state:
+                    case Executing(future=fut) | Init(future=fut):
+                        assert future.done()
+                        if future is not fut:
+                            print(f"Stale event: actor {actor} state has different future {fut}")
+                        # perform all possible state transitions
+                        return self._chain_transitions(actor, play)
+                    case state:
+                        print(f"Stale event: actor {actor} has unexpected state {state}")
+                        return play
+
+            case RequestCompleted(actor=actor, request=request, future=future):
+                if actor not in play.states:
+                    print(f"Stale event: actor {actor} gone")
+                    return play
+                actor_state = play.states[actor]
+                match actor_state:
+                    case Pending(request=req, response_future=fut):
+                        assert future.done()
+                        if req is not request or fut is not future:
+                            print(f"Stale event: actor {actor} state has different future {fut}")
+                        return self._chain_transitions(actor, play)
+                    case state:
+                        print(f"Stale event: actor {actor} has unexpected state {state}")
+                        return play
+            case _:
+                raise NotImplementedError(event)
+
+
     def run(self, main_actor, *args):
         main_props = args
         main_sheet = self._create_actor(main_actor, main_props)
@@ -332,9 +414,17 @@ class Theatre:
         # Explicit state wrappers:
         # Init -> Pending(req) -> Executing -> Terminated
         actors: dict[ActorAddr, ActorSheet] = {main_sheet.address: main_sheet}
+        protagonist_init_future = self.executor.submit(main_sheet.play.send, None)
+        def init_callback(fut):
+            print(f"protagonist done initializing {fut=}")
+            self._events.put(EndOfScene(
+                actor=main_sheet.address,
+                future=fut
+            ))
+        protagonist_init_future.add_done_callback(init_callback)
         states: dict[ActorAddr, ActorState] = {
             main_sheet.address: Init(
-                future=self.executor.submit(main_sheet.play.send, None)
+                future=protagonist_init_future
             )
         }
 
@@ -351,17 +441,19 @@ class Theatre:
             print(f"{len(states)} actors on stage")
             print(f"{threading.active_count()} active threads")
 
-            # events = drain(self._events, timeout=self.clock_tick)
-            # if not events:
-            #     print(f"({cnt}) No events in last cycle ({self.clock_tick}s)")
-            #     continue
+            events = list(drain(self._events, timeout=self.clock_tick))
+            if not events:
+                print(f"({cnt}) No events in last cycle ({self.clock_tick}s)")
+                continue
 
-            # for event in events:
-            #     states, actors, exit_value, exit_error = self._handle_event(event, states, actors)
+            print(f"{len(events)} events to handle")
+            for event in events:
+                play = self._handle_event(event, play)
+                print(f"Handled event {event}")
 
-            for addr in list(states.keys()):
-                play = self._process_state(addr, play)
-                print(f"Processed state of actor {addr=}")
+            # for addr in list(states.keys()):
+            #     play = self._process_state(addr, play)
+            #     print(f"Processed state of actor {addr=}")
 
         print(f"Terminating play: {play.exit=}")
 
