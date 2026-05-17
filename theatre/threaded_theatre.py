@@ -77,6 +77,8 @@ class Terminated:
 class Receiving:
     """Actor waiting for a message in mailbox"""
 
+    request: object
+
 
 ActorState = Init | Waiting | Awaiting | Executing | Receiving | Terminated
 
@@ -273,7 +275,7 @@ class Theatre:
                 try:
                     msg = sheet.mailbox.get_nowait()
                 except queue.Empty:
-                    play.states[addr] = Receiving()
+                    play.states[addr] = Receiving(request=request)
                 else:
                     resp_future = Future()
                     resp_future.set_result(msg)
@@ -452,13 +454,13 @@ class Theatre:
                     return
                 actor_state = play.states[actor]
                 match actor_state:
-                    case Receiving():
+                    case Receiving(request=request):
                         sheet = play.actors[actor]
                         msg = sheet.mailbox.get_nowait()
                         resp_future = Future()
                         resp_future.set_result(msg)
                         play.states[actor] = Awaiting(
-                            request=receive(), response_future=resp_future
+                            request=request, response_future=resp_future
                         )
                         self._chain_transitions(actor, play)
                     case _:
