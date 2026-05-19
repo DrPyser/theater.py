@@ -84,34 +84,54 @@ ActorState = Init | Waiting | Awaiting | Executing | Receiving | Terminated
 
 
 class Event:
-    pass
+    @dataclass
+    class ActorEvent:
+        actor: ActorAddr
 
+
+    @dataclass
+    class RequestCompleted(ActorEvent):
+        request: Any
+        future: Future
+
+
+    @dataclass
+    class EndOfScene(ActorEvent):
+        future: Future
+
+
+    @dataclass
+    class MessageDelivered(ActorEvent):
+        pass
+
+    @dataclass
+    class SpawnRequested:
+        script: Actor
+        props: tuple[Any, ...]
+        protagonist: bool
+        result_future: Future
+
+    class Stop(Exception):
+        def __init__(self):
+            super().__init__("Stopping play")
+
+    @dataclass
+    class RegisterCondition:
+        predicate: Callable[[Play], bool]
+        projection: Callable[[Play], Any]
+        future: Future
 
 @dataclass
-class ActorEvent(Event):
-    actor: ActorAddr
+class NormalExit:
+    value: Any
 
 
-@dataclass
-class RequestCompleted(ActorEvent):
-    request: Any
-    future: Future
+class ErrorExit(Exception):
+    def __init__(self, cause, context=None):
+        self.cause = cause
+        self.context = context
 
-
-@dataclass
-class EndOfScene(ActorEvent):
-    future: Future
-
-
-@dataclass
-class MessageDelivered(ActorEvent):
-    pass
-
-
-class Stop(Exception):
-    def __init__(self):
-        super().__init__("Stopping play")
-
+Exit = NormalExit | ErrorExit
 
 class DestinationNotFound(Exception):
     def __init__(self, destination: ActorAddr):
@@ -213,7 +233,7 @@ class Theatre:
         print(f"submitting performance for actor {addr}: {fn.__qualname__}({args!r})")
         fut = self.executor.submit(fn, *args)
         fut.add_done_callback(
-            lambda f: self._events.put(EndOfScene(actor=addr, future=f))
+            lambda f: self._events.put(Event.EndOfScene(actor=addr, future=f))
         )
         return fut
 
@@ -222,7 +242,7 @@ class Theatre:
         fut = self.executor.submit(fn, *args)
         fut.add_done_callback(
             lambda f: self._events.put(
-                RequestCompleted(actor=addr, request=request, future=f)
+                Event.RequestCompleted(actor=addr, request=request, future=f)
             )
         )
         return fut
@@ -403,15 +423,15 @@ class Theatre:
             state = play.states[actor]
 
     def _handle_event(self, event: Event, play: Play) -> None:
-        print(f"Handling event {event}")
+        print(f"Handling event {event=}")
         match event:
-            case Stop():
+            case Event.Stop():
                 # received stop signal
                 # for graceful shutdown: cancel any pending future,
                 # transition all actors state to Terminated?
                 print("Pulled Stop event from queue")
                 raise event
-            case EndOfScene(actor=actor, future=future):
+            case Event.EndOfScene(actor=actor, future=future):
                 if actor not in play.states:
                     print(f"Stale event: actor {actor} gone")
                     return
@@ -425,12 +445,15 @@ class Theatre:
                             )
                         self._chain_transitions(actor, play)
                         return
+                    case Receiving():
+                        # already transitioned to Receiving state from receive request
+                        pass
                     case state:
                         print(
                             f"Stale event: actor {actor} has unexpected state {state}"
                         )
 
-            case RequestCompleted(actor=actor, request=request, future=future):
+            case Event.RequestCompleted(actor=actor, request=request, future=future):
                 if actor not in play.states:
                     print(f"Stale event: actor {actor} gone")
                     return
@@ -448,7 +471,7 @@ class Theatre:
                             f"Stale event: actor {actor} has unexpected state {state}"
                         )
 
-            case MessageDelivered(actor=actor):
+            case Event.MessageDelivered(actor=actor):
                 if actor not in play.states:
                     print(f"Stale event: actor {actor} gone")
                     return
@@ -487,7 +510,7 @@ class Theatre:
                 for event in events:
                     try:
                         self._handle_event(event, self._play)
-                    except Stop:
+                    except Event.Stop:
                         print(
                             f"({loop_count}) Stop exception raised, terminating event loop"
                         )
