@@ -12,9 +12,10 @@ import itertools
 from collections import deque
 from collections.abc import Iterator
 from contextvars import copy_context
-from typing import NewType, Any
-from dataclasses import dataclass
+from typing import NewType, Any, Callable
+from dataclasses import dataclass, field
 import time
+from traceback import print_exc
 
 
 def create_actor_sheet(actor_script, props, addr, mailbox):
@@ -175,23 +176,14 @@ def drain(queue_: queue.Queue[Event], timeout=None) -> Iterator[Event]:
             yield event
 
 
-@dataclass
-class NormalExit:
-    value: Any
-
-
-class ErrorExit(Exception):
-    def __init__(self, cause, context=None):
-        self.cause = cause
-        self.context = context
-
 
 @dataclass
 class Play:
     states: dict[ActorAddr, ActorState]
     actors: dict[ActorAddr, ActorSheet]
-    protagonist: ActorAddr
-    exit: ErrorExit | NormalExit | None = None
+    protagonist: ActorAddr | None = None
+    protagonist_result: Future | None = None
+    conditions: list[Event.RegisterCondition] = field(default_factory=list)
 
 
 class Theatre:
@@ -221,18 +213,6 @@ class Theatre:
     def make_addr(self, script, props) -> ActorAddr:
         addr = hash((script, props, next(self._counter)))
         return ActorAddr(addr)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc, typ, tb):
-        self.stop()
-        if self._thread and self._thread.is_alive():
-            self._thread.join()
-        self.executor.shutdown(cancel_futures=True)
-
-    def stop(self):
-        self._events.put(Stop())
 
     def _submit_performance(self, addr, fn, *args):
         print(f"submitting performance for actor {addr}: {fn.__qualname__}({args!r})")
@@ -268,14 +248,9 @@ class Theatre:
                 play.states[addr] = Terminated(result=value)
 
             case spawn(script, props):
-                new_sheet = self._create_actor(script, props)
-                play.actors[new_sheet.address] = new_sheet
-                future = self._submit_performance(
-                    new_sheet.address, new_sheet.play.send, None
-                )
-                play.states[new_sheet.address] = Init(future=future)
+                child = self._spawn(script, props, play=play)
                 resp_future = Future()
-                resp_future.set_result(new_sheet.address)
+                resp_future.set_result(child)
                 play.states[addr] = Awaiting(
                     request=request, response_future=resp_future
                 )
@@ -288,9 +263,16 @@ class Theatre:
             case send(dest_addr, msg):
                 resp_future = Future()
                 if destination := play.actors.get(dest_addr):
-                    destination.mailbox.put(msg)
-                    self._events.put(MessageDelivered(actor=dest_addr))
-                    resp_future.set_result(None)
+                    match play.states[dest_addr]:
+                        case Terminated(result=result, error=error):
+                            resp_future.set_exception(ActorTerminated(
+                                dest_addr,
+                                ErrorExit(error) if error else NormalExit(result)
+                            ))
+                        case _:
+                            destination.mailbox.put(msg)
+                            self._events.put(Event.MessageDelivered(actor=dest_addr))
+                            resp_future.set_result(None)
                 else:
                     resp_future.set_exception(DestinationNotFound(dest_addr))
                 play.states[addr] = Awaiting(
@@ -392,27 +374,27 @@ class Theatre:
                 print(f"actor({addr}) still executing (future {fut})")
                 return False
 
-            case Receiving():
+            case Receiving(request=request):
+                print(f"actor ({addr}) still in Receiving state for request {request=}")
                 return False
 
             case Terminated(result=result, error=error):
+                if play.protagonist and addr == play.protagonist:
+                    if error:
+                        print(
+                            f"protagonist ({addr}) terminated with error"
+                        )
+                        play.protagonist_result.set_exception(error)
+                    else:
+                        print(
+                            f"protagonist ({addr}) terminated with success"
+                        )
+                        play.protagonist_result.set_result(result)
                 if error:
                     print(f"actor {addr} is terminated with error: {error}")
-                    if addr == play.protagonist:
-                        print(
-                            f"protagonist ({addr}) terminated with error, setting exit error"
-                        )
-                        play.exit = ErrorExit(error)
                 else:
                     print(f"actor {addr} is terminated with value {result}")
-                    if addr == play.protagonist:
-                        print(
-                            f"protagonist ({addr}) terminated with success, setting exit value"
-                        )
-                        play.exit = NormalExit(value=result)
                 # TODO: handle terminated actors (links, cleanup)
-                play.states.pop(addr)
-                play.actors.pop(addr)
                 return False
 
     def _chain_transitions(self, actor: ActorAddr, play: Play) -> None:
@@ -493,6 +475,16 @@ class Theatre:
                         self._chain_transitions(actor, play)
                     case _:
                         pass
+            case Event.RegisterCondition(predicate=pred, projection=proj, future=fut):
+                self._play.conditions.append(event)
+            case Event.SpawnRequested(script, props, protagonist, result_future):
+                address = self._spawn(
+                    script=script, props=props, protagonist=protagonist
+                )
+                result_future.set_result(address)
+                self._chain_transitions(address, play)
+            case _:
+                print(f"Unknown event {event=}")
 
     def _run_loop(self):
         try:
@@ -500,10 +492,10 @@ class Theatre:
 
             loop_count = itertools.count()
             stop = False
-            while self._play.states and not stop:
+            while not stop:
                 cnt = next(loop_count)
                 print(f"Running main loop ({cnt})")
-                print(f"{len(self._play.states)} actors on stage")
+                print(f"{sum(1 for s in self._play.states.values() if not isinstance(s, Terminated))} actors on stage")
                 print(f"{threading.active_count()} active threads")
 
                 events = list(drain(self._events, timeout=self.clock_tick))
@@ -523,37 +515,134 @@ class Theatre:
                         break
                     print(f"Handled event {event}")
 
-            print(f"Terminating play: {stop=} {self._play.exit=}")
+                triggered_conditions = []
+                for condition in self._play.conditions:
+                    try:
+                        if condition.predicate(self._play):
+                            print(f"Condition predicate satisified {condition=}")
+                            try:
+                                result = condition.projection(self._play)
+                            except Exception as ex:
+                                print(f"Condition projection raised {condition=}: {ex}")
+                                condition.future.set_exception(ex)
+                            else:
+                                print(f"Condition projection successful {condition=}: {result}")
+                                condition.future.set_result(result)
+                            finally:
+                                triggered_conditions.append(condition)
+                    except Exception as ex:
+                        print(f"Exception from condition predicate {condition.predicate=}: {ex}")
+                        continue
+                for condition in triggered_conditions:
+                    self._play.conditions.remove(condition)
+
+            print(f"Terminating play: {stop=} {self._play.protagonist_result=}")
         except BaseException as ex:
             print(f"Theatre run loop raised exception: {ex}")
+            print_exc()
             raise
 
-    def run(self, protagonist: Actor, *props):
-        main_props = props
-        main_sheet = self._create_actor(protagonist, main_props)
+    def _stop(self):
+        assert self._thread and self._thread.is_alive()
+        self._events.put(Event.Stop())
 
-        # Explicit state wrappers:
-        # Init -> Waiting -> Awaiting/Receiving -> Executing -> Terminated
-        actors: dict[ActorAddr, ActorSheet] = {main_sheet.address: main_sheet}
-        states: dict[ActorAddr, ActorState] = {
-            main_sheet.address: Init(
-                future=self._submit_performance(
-                    main_sheet.address, main_sheet.play.send, None
-                )
-            )
-        }
-
-        self._play = Play(states=states, actors=actors, protagonist=main_sheet.address)
+    def _start(self):
+        self._play = Play(states={}, actors={})
         self._thread = threading.Thread(
             name=f"theatre-{id(self)}", target=self._run_loop
         )
+        print(f"Starting run loop thread {self._thread=}")
         self._thread.start()
-        self._thread.join()
-        print("Run loop thread terminated")
-        match self._play.exit:
-            case ErrorExit():
-                raise self._play.exit
-            case NormalExit(value=value):
+
+    def _spawn(self, script: Actor, props: tuple, play=None, protagonist=False):
+        print(f"Processing spawn request {script=} {props=} {protagonist=}")
+        play = play or self._play
+        sheet = self._create_actor(script, props)
+        play.actors[sheet.address] = sheet
+        play.states[sheet.address] = Init(
+            future=self._submit_performance(
+                sheet.address, sheet.play.send, None
+            )
+        )
+        if protagonist:
+            play.protagonist = sheet.address
+            play.protagonist_result = Future()
+            print(f"Protagonist introduced to play {play.protagonist}")
+
+        return sheet.address
+
+    def spawn(self, script, *props, protagonist=False):
+        assert self._thread.is_alive()
+        result_future = Future()
+        event = Event.SpawnRequested(
+            script=script,
+            props=props,
+            protagonist=protagonist,
+            result_future=result_future
+        )
+        self._events.put(event)
+        print(f"Awaiting spawn request response {result_future=}")
+        new_address = result_future.result()
+        return new_address
+
+    def run(self, protagonist: Actor, *props):
+        if not (self._thread and self._thread.is_alive()):
+            raise RuntimeError("No running run loop thread!")
+        if self._play.protagonist_result is not None:
+            raise RuntimeError("A run is already in progress")
+
+        protagonist_address = self.spawn(
+            protagonist, *props, protagonist=True
+        )
+
+        return self.spotlight(protagonist_address)
+
+    def wait_ensemble(self):
+        # wait for all actors to terminate
+        # TODO: generic mechanism for waiting conditions
+        # & signaling based on actors states
+        future = Future()
+        self._events.put(
+            Event.RegisterCondition(
+                predicate=lambda play: all(isinstance(state, Terminated) for state in play.states.values()),
+                projection=lambda play: [
+                    (addr, ErrorExit(state.error) if state.error else NormalExit(state.result))
+                    for addr, state in play.states.items()
+                ],
+                future=future
+            )
+        )
+        return future.result()
+
+    def spotlight(self, actor: ActorAddr):
+        # wait for a specific actor to terminate
+        future = Future()
+        self._events.put(
+            Event.RegisterCondition(
+                predicate=lambda play: actor in play.states and isinstance(play.states[actor], Terminated),
+                projection=lambda play: (
+                    ErrorExit(play.states[actor].error)
+                    if play.states[actor].error
+                    else NormalExit(play.states[actor].result)
+                ),
+                future=future
+            )
+        )
+        match future.result():
+            case NormalExit(value):
                 return value
-            case None:
-                return None
+            case ErrorExit(cause=error):
+                raise error
+
+    def __enter__(self):
+        self._start()
+        return self
+
+    def __exit__(self, exc, typ, tb):
+        if self._thread and self._thread.is_alive():
+            self._stop()
+            self._thread.join()
+        # cancel pending tasks if exception is raised
+        # else gracefully complete remaining tasks
+        self.executor.shutdown(cancel_futures=bool(exc))
+

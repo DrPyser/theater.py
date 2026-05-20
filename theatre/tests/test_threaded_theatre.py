@@ -12,6 +12,7 @@ from theatre.threaded_theatre import (
     UnsupportedRequest,
     drain,
     ErrorExit,
+    NormalExit,
     Receiving,
     ActorTerminated
 )
@@ -256,3 +257,42 @@ def test_non_blocking_receive():
     with curtain_call(executor=ThreadPoolExecutor(max_workers=1)) as theatre:
         result = theatre.run(sender)
         assert result == "done"
+
+
+def test_theatre_spawn_and_spotlight():
+    def waiter():
+        msg = yield receive()
+        return msg
+
+    def replier(address):
+        yield send(address, "hello")
+
+    with curtain_call() as theatre:
+        waiter_address = theatre.spawn(waiter, protagonist=True)
+        theatre.spawn(replier, waiter_address)
+        result = theatre.spotlight(waiter_address)
+        assert result == "hello"
+
+
+def test_theatre_wait_ensemble():
+    def waiter():
+        msg = yield receive()
+        return msg
+
+    def replier(addresses):
+        for addr in addresses:
+            yield send(addr, f"hello {addr}")
+
+    with curtain_call() as theatre:
+        waiters = []
+        for i in range(10):
+            waiter_address = theatre.spawn(waiter)
+            waiters.append(waiter_address)
+        replier_addr = theatre.spawn(replier, tuple(waiters))
+        results = theatre.wait_ensemble()
+        for addr, res in results:
+            if addr in waiters:
+                assert res == NormalExit(f"hello {addr}")
+            else:
+                assert addr == replier_addr
+                assert res == NormalExit(None)
