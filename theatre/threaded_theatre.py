@@ -143,6 +143,11 @@ class ActorCancelled(Exception):
         self.actor = actor
 
 
+class ActorTerminated(Exception):
+    def __init__(self, actor: ActorAddr, exit: Exit):
+        self.actor = actor
+        self.exit = exit
+
 class UnsupportedRequest(Exception):
     def __init__(self, actor: ActorAddr, req: Any):
         self.actor = actor

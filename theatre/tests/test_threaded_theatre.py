@@ -13,6 +13,7 @@ from theatre.threaded_theatre import (
     drain,
     ErrorExit,
     Receiving,
+    ActorTerminated
 )
 import queue
 
@@ -135,9 +136,9 @@ def test_theatre_run_actor_terminated_with_error():
         yield Theatre.exit()
 
     with curtain_call() as theatre:
-        with pytest.raises(ErrorExit) as ex:
+        with pytest.raises(Exception) as ex:
             theatre.run(failing_actor)
-        assert ex.value.cause.args == ("Forgot my lines",)
+        assert ex.value.args == ("Forgot my lines",)
 
 
 def test_theatre_run_multiple_actors_terminated():
@@ -166,10 +167,8 @@ def test_send_to_terminated_actor_raises():
         yield send(doomed, "test")
 
     with curtain_call() as theatre:
-        with pytest.raises(ErrorExit) as exc:
+        with pytest.raises(ActorTerminated) as exc:
             result = theatre.run(sender)
-
-        assert isinstance(exc.value.cause, DestinationNotFound)
 
 
 def test_send_to_terminated_actor_caught():
@@ -181,7 +180,7 @@ def test_send_to_terminated_actor_caught():
         yield Theatre.sleep(0.01)
         try:
             yield send(doomed, "test")
-        except DestinationNotFound:
+        except ActorTerminated:
             pass
         yield Theatre.exit("sender_success")
 
@@ -222,10 +221,8 @@ def test_cancelled_init():
         yield Theatre.self()
 
     with Theatre(mock_executor) as theatre:
-        with pytest.raises(ErrorExit) as exc:
+        with pytest.raises(ActorCancelled) as exc:
             theatre.run(main_actor)
-
-        assert isinstance(exc.value.cause, ActorCancelled)
 
 
 @pytest.mark.skip(reason="cancellation does not work for receive requests right now")
@@ -241,19 +238,6 @@ def test_cancelled_request():
         with theatre.spawn(main_actor) as addr:
             theatre.cancel(addr)
         assert result == "cancelled_ok"
-
-
-# def test_threadpool_exhaustion():
-#     def abandonned(*args):
-#         msg = yield receive()
-#         yield Theatre.exit(msg)
-
-#     def spawner(*args):
-#         for i in range(10):
-#             yield spawn(abandonned)
-
-#     with curtain_call() as theatre:
-#         theatre.run(spawner)
 
 
 def test_non_blocking_receive():
