@@ -464,12 +464,6 @@ class Theatre:
                         addr, sheet.play.throw, DestinationNotFound(actor)
                     )
                     play.states[addr] = State.Executing(future=future)
-                elif isinstance(play.states[actor], State.Terminated):
-                    # target actor already terminated
-                    future = self._submit_performance(
-                        addr, sheet.play.throw, ActorTerminated(actor, play.states[actor].cause)
-                    )
-                    play.states[addr] = State.Executing(future=future)
                 else:
                     self._link(addr, actor, play)
                     future = self._submit_performance(
