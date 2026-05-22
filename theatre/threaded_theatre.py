@@ -106,7 +106,14 @@ class State:
         request: object
 
 
-ActorState = State.Init | State.Waiting | State.Awaiting | State.Executing | State.Receiving | State.Terminated
+ActorState = (
+    State.Init
+    | State.Waiting
+    | State.Awaiting
+    | State.Executing
+    | State.Receiving
+    | State.Terminated
+)
 
 
 class Signal(enum.Enum):
@@ -283,6 +290,7 @@ class Play:
 class link:
     target: ActorAddr
 
+
 @dataclass
 class spawn_link(spawn):
     pass
@@ -347,18 +355,22 @@ class Theatre:
         # register link callback
         print(f"registering link condition: owner({owner}) <- target({target})")
         future = Future()
+
         def get_termination_cause(play):
             return play.states[target].cause
+
         def link_callback(fut: Future):
-            print(f"link trap callback: signaling link trap event owner({owner}) <- target({target})")
-            self._events.put(
-                Event.LinkTrap(linker=owner, linked=target, future=fut)
+            print(
+                f"link trap callback: signaling link trap event owner({owner}) <- target({target})"
             )
+            self._events.put(Event.LinkTrap(linker=owner, linked=target, future=fut))
+
         future.add_done_callback(link_callback)
         self._events.put(
             Event.RegisterCondition(
                 predicate=lambda play: (
-                    target in play.states and isinstance(play.states[target], State.Terminated)
+                    target in play.states
+                    and isinstance(play.states[target], State.Terminated)
                 ),
                 projection=get_termination_cause,
                 future=future,
@@ -502,9 +514,7 @@ class Theatre:
                     play.states[addr] = State.Executing(future=future)
                 else:
                     self._link(addr, actor, play)
-                    future = self._submit_performance(
-                        addr, sheet.play.send, None
-                    )
+                    future = self._submit_performance(addr, sheet.play.send, None)
                     play.states[addr] = State.Executing(future=future)
             case _:
                 print(f"unexpected request {request}")
@@ -693,9 +703,7 @@ class Theatre:
             case Event.RegisterCondition(predicate=pred, projection=proj, future=fut):
                 self._play.conditions.append(event)
             case Event.SpawnRequested(script, props, result_future):
-                address = self._spawn(
-                    script=script, props=props
-                )
+                address = self._spawn(script=script, props=props)
                 result_future.set_result(address)
                 self._chain_transitions(address, play)
             case Event.Signal(actor, signal):
@@ -710,32 +718,50 @@ class Theatre:
             case Event.LinkTrap(linker, linked, future):
                 linker_sheet = play.actors[linker]
                 linker_state = play.states[linker]
-                print(f"handling link trap: target({linked}) -> owner({linker}, state={linker_state})")
+                print(
+                    f"handling link trap: target({linked}) -> owner({linker}, state={linker_state})"
+                )
                 match linker_state:
                     case State.Terminated():
-                        print(f"Link owner {linker} terminated before handling link trap for target {linked}")
+                        print(
+                            f"Link owner {linker} terminated before handling link trap for target {linked}"
+                        )
                     case State.Executing(exec_future):
-                        print(f"link owner {linker} in Executing state, chaining trap propagation")
+                        print(
+                            f"link owner {linker} in Executing state, chaining trap propagation"
+                        )
+
                         def exec_chain():
                             try:
                                 req = exec_future.result()
                             except Exception:
                                 raise
                             else:
-                                print(f"actor({linker}): ignoring request {req} to signal link trap from {linked}")
-                                linker_sheet.play.throw(ActorTerminated(linked, future.result()))
+                                print(
+                                    f"actor({linker}): ignoring request {req} to signal link trap from {linked}"
+                                )
+                                linker_sheet.play.throw(
+                                    ActorTerminated(linked, future.result())
+                                )
+
                         new_exec_future = self._submit_performance(linker, exec_chain)
                         play.states[linker] = State.Executing(new_exec_future)
                     case State.Awaiting(response_future=fut):
-                        print(f"link owner {linker} in Awaiting state, cancelling task and propagating trap")
+                        print(
+                            f"link owner {linker} in Awaiting state, cancelling task and propagating trap"
+                        )
                         fut.cancel()
                         exec_future = self._submit_performance(
-                            linker, linker_sheet.play.throw, ActorTerminated(linked, future.result())
+                            linker,
+                            linker_sheet.play.throw,
+                            ActorTerminated(linked, future.result()),
                         )
                         play.states[linker] = State.Executing(exec_future)
                     case _:
                         exec_future = self._submit_performance(
-                            linker, linker_sheet.play.throw, ActorTerminated(linked, future.result())
+                            linker,
+                            linker_sheet.play.throw,
+                            ActorTerminated(linked, future.result()),
                         )
                         play.states[linker] = State.Executing(exec_future)
                 self._chain_transitions(linker, play)
@@ -751,10 +777,12 @@ class Theatre:
             while not stop:
                 cnt = next(loop_count)
                 print(f"Running main loop ({cnt})")
-                alive_count = sum(1 for s in self._play.states.values() if not isinstance(s, State.Terminated))
-                print(
-                    f"{alive_count} actors on stage"
+                alive_count = sum(
+                    1
+                    for s in self._play.states.values()
+                    if not isinstance(s, State.Terminated)
                 )
+                print(f"{alive_count} actors on stage")
                 print(f"{threading.active_count()} active threads")
 
                 events = list(drain(self._events, timeout=self.clock_tick))
@@ -854,7 +882,8 @@ class Theatre:
         self._events.put(
             Event.RegisterCondition(
                 predicate=lambda play: all(
-                    isinstance(state, State.Terminated) for state in play.states.values()
+                    isinstance(state, State.Terminated)
+                    for state in play.states.values()
                 ),
                 projection=lambda play: [
                     (addr, state.cause) for addr, state in play.states.items()
@@ -870,7 +899,8 @@ class Theatre:
         self._events.put(
             Event.RegisterCondition(
                 predicate=lambda play: (
-                    actor in play.states and isinstance(play.states[actor], State.Terminated)
+                    actor in play.states
+                    and isinstance(play.states[actor], State.Terminated)
                 ),
                 projection=lambda play: play.states[actor].cause,
                 future=future,
