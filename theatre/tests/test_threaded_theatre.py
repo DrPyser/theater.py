@@ -1,4 +1,5 @@
 import pytest
+import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from theatre.threaded_theatre import (
     Theatre,
@@ -17,6 +18,8 @@ from theatre.threaded_theatre import (
     MailboxFull,
     Signal,
     ActorSignaled,
+    link,
+    spawn_link,
 )
 import queue
 
@@ -372,3 +375,97 @@ def test_sigkill():
         with pytest.raises(ActorSignaled) as exc:
             theatre.spotlight(addr)
         assert exc.value.signal is Signal.KILL
+
+
+def test_link_trap_while_receive():
+    def link_target(*args):
+        yield receive()
+        yield Theatre.exit("done")
+
+    def linker(*args):
+        addr = yield spawn(link_target)
+        yield link(addr)
+        yield send(addr, "hello")
+        try:
+            yield receive()
+        except ActorTerminated as ex:
+            assert ex.actor == addr
+            assert ex.cause == NormalExit("done")
+
+    with curtain_call() as theatre:
+        theatre.run(linker)
+
+
+def test_link_trap_while_sleeping():
+    def link_target(*args):
+        yield receive()
+        yield Theatre.exit("done")
+
+    def linker(*args):
+        addr = yield spawn(link_target)
+        yield link(addr)
+        yield send(addr, "hello")
+        try:
+            yield Theatre.sleep(0.5)
+        except ActorTerminated as ex:
+            assert ex.actor == addr
+            assert ex.cause == NormalExit("done")
+
+    with curtain_call() as theatre:
+        theatre.run(linker)
+
+
+def test_link_trap_after_termination():
+    def link_target(*args):
+        yield receive()
+        yield Theatre.exit("done")
+
+    def linker(*args):
+        addr = yield spawn(link_target)
+        yield link(addr)
+        yield send(addr, "hello")
+
+    with curtain_call() as theatre:
+        theatre.run(linker)
+
+
+def test_spawn_link_trap_while_receiving():
+    def link_target(*args):
+        yield receive()
+        yield Theatre.exit("done")
+
+    def linker(*args):
+        addr = yield spawn_link(link_target)
+        yield send(addr, "hello")
+        try:
+            yield receive()
+        except ActorTerminated as ex:
+            assert ex.actor == addr
+            assert ex.cause == NormalExit("done")
+
+    with curtain_call() as theatre:
+        theatre.run(linker)
+
+
+def test_fire_in_theatre_while_receive():
+    def actor(*args):
+        while True:
+            msg = yield receive()
+
+    with pytest.raises(Exception):
+        with curtain_call() as theatre:
+            theatre.spawn(actor)
+            raise Exception()
+    assert threading.active_count() == 1
+
+
+def test_fire_in_theatre_while_sleep():
+    def actor(*args):
+        while True:
+            msg = yield Theatre.sleep(0.5)
+
+    with pytest.raises(Exception):
+        with curtain_call() as theatre:
+            theatre.spawn(actor)
+            raise Exception()
+    assert threading.active_count() == 1
