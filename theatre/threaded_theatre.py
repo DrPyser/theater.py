@@ -98,17 +98,14 @@ class Event:
     class ActorEvent:
         actor: ActorAddr
 
-
     @dataclass
     class RequestCompleted(ActorEvent):
         request: Any
         future: Future
 
-
     @dataclass
     class EndOfScene(ActorEvent):
         future: Future
-
 
     @dataclass
     class MessageDelivered(ActorEvent):
@@ -131,6 +128,12 @@ class Event:
         projection: Callable[[Play], Any]
         future: Future
 
+    @dataclass
+    class Signal:
+        actor: ActorAddr
+        signal: Signal
+
+
 @dataclass
 class NormalExit:
     value: Any
@@ -143,7 +146,9 @@ class ErrorExit(Exception):
         self.cause = cause
         self.context = context
 
+
 Exit = NormalExit | ErrorExit
+
 
 class DestinationNotFound(Exception):
     def __init__(self, destination: ActorAddr):
@@ -159,6 +164,12 @@ class ActorTerminated(Exception):
     def __init__(self, actor: ActorAddr, cause: Exit | Signal):
         self.actor = actor
         self.cause = cause
+
+
+class ActorSignaled(Exception):
+    def __init__(self, actor: ActorAddr, signal: Signal):
+        self.actor = actor
+        self.signal = signal
 
 
 class MailboxFull(Exception):
@@ -227,7 +238,6 @@ def drain(queue_: queue.Queue[Event], timeout=None) -> Iterator[Event]:
             yield event
 
 
-
 @dataclass
 class Play:
     states: dict[ActorAddr, ActorState]
@@ -288,6 +298,58 @@ class Theatre:
         mailbox = lambda: Mailbox(maxlen=self.queue_size)
         sheet = create_actor_sheet(script, props, addr, mailbox)
         return sheet
+
+    def _handle_signal(self, actor: ActorAddr, signal: Signal, play: Play):
+        # TODO: flag actor as cancelled, cancel any pending future
+        # dispatch actor's coroutine on a throw to handle the cancellation
+        sheet = play.actors[actor]
+        state = play.states[actor]
+        match signal:
+            case Signal.KILL:
+                match state:
+                    case State.Terminated():
+                        # nothing to do
+                        print(f"SIGKILL sent to terminated actor {actor}")
+                    case (
+                        State.Init(future)
+                        | State.Awaiting(response_future=future)
+                        | State.Executing(future)
+                    ):
+                        print(
+                            f"actor({actor}) received SIGKILL during execution of future {future}; cancelling and terminating"
+                        )
+                        future.cancel()
+                        play.states[actor] = State.Terminated(cause=signal)
+                    case _:  # no pending future or state to cleanup
+                        print(
+                            f"actor({actor}) received SIGKILL while in state {state}; terminating"
+                        )
+                        play.states[actor] = State.Terminated(cause=signal)
+            case Signal.INT:
+                match play.states[actor]:
+                    case State.Terminated():
+                        print(f"SIGINT sent to terminated actor {actor}")
+                        pass
+                    case (
+                        State.Init(future)
+                        | State.Awaiting(response_future=future)
+                        | State.Executing(future)
+                    ):
+                        future.cancel()
+                        exec_future = self._submit_performance(
+                            actor, sheet.play.throw, ActorCancelled(actor)
+                        )
+                        play.states[actor] = State.Executing(exec_future)
+                    case state:
+                        print(
+                            f"actor({actor}) received SIGINT while in state {state}; scheduling signal handling opportunity"
+                        )
+                        exec_future = self._submit_performance(
+                            actor, sheet.play.throw, ActorCancelled(actor)
+                        )
+                        play.states[actor] = State.Executing(exec_future)
+            case _:
+                raise NotImplementedError()
 
     def _handle_request(self, addr, request, play: Play):
         print(f"handling request: actor({addr}), request({request})")
@@ -515,6 +577,9 @@ class Theatre:
                         )
 
             case Event.MessageDelivered(actor=actor):
+                print(
+                    f"actor({actor}) mailbox now has {len(play.actors[actor].mailbox)} messages"
+                )
                 if actor not in play.states:
                     print(f"Stale event: actor {actor} gone")
                     return
@@ -551,6 +616,9 @@ class Theatre:
                 )
                 result_future.set_result(address)
                 self._chain_transitions(address, play)
+            case Event.Signal(actor, signal):
+                self._handle_signal(actor, signal, play)
+                self._chain_transitions(actor, play)
             case _:
                 print(f"Unknown event {event=}")
 
@@ -563,7 +631,10 @@ class Theatre:
             while not stop:
                 cnt = next(loop_count)
                 print(f"Running main loop ({cnt})")
-                print(f"{sum(1 for s in self._play.states.values() if not isinstance(s, Terminated))} actors on stage")
+                alive_count = sum(1 for s in self._play.states.values() if not isinstance(s, State.Terminated))
+                print(
+                    f"{alive_count} actors on stage"
+                )
                 print(f"{threading.active_count()} active threads")
 
                 events = list(drain(self._events, timeout=self.clock_tick))
@@ -594,12 +665,16 @@ class Theatre:
                                 print(f"Condition projection raised {condition=}: {ex}")
                                 condition.future.set_exception(ex)
                             else:
-                                print(f"Condition projection successful {condition=}: {result}")
+                                print(
+                                    f"Condition projection successful {condition=}: {result}"
+                                )
                                 condition.future.set_result(result)
                             finally:
                                 triggered_conditions.append(condition)
                     except Exception as ex:
-                        print(f"Exception from condition predicate {condition.predicate=}: {ex}")
+                        print(
+                            f"Exception from condition predicate {condition.predicate=}: {ex}"
+                        )
                         continue
                 for condition in triggered_conditions:
                     self._play.conditions.remove(condition)
@@ -644,7 +719,7 @@ class Theatre:
             script=script,
             props=props,
             protagonist=protagonist,
-            result_future=result_future
+            result_future=result_future,
         )
         self._events.put(event)
         print(f"Awaiting spawn request response {result_future=}")
@@ -657,9 +732,7 @@ class Theatre:
         if self._play.protagonist_result is not None:
             raise RuntimeError("A run is already in progress")
 
-        protagonist_address = self.spawn(
-            protagonist, *props, protagonist=True
-        )
+        protagonist_address = self.spawn(protagonist, *props, protagonist=True)
 
         return self.spotlight(protagonist_address)
 
@@ -698,6 +771,17 @@ class Theatre:
                 return value
             case ErrorExit(cause=error):
                 raise error
+            case Signal() as signal:
+                raise ActorSignaled(actor, signal)
+
+    def cancel(self, actor: ActorAddr):
+        self._events.put(Event.Signal(actor, Signal.INT))
+
+    def kill(self, actor: ActorAddr):
+        self._events.put(Event.Signal(actor, Signal.KILL))
+
+    def signal(self, actor: ActorAddr, signal: Signal):
+        self._events.put(Event.Signal(actor, signal))
 
     def __enter__(self):
         self._start()
@@ -710,4 +794,3 @@ class Theatre:
         # cancel pending tasks if exception is raised
         # else gracefully complete remaining tasks
         self.executor.shutdown(cancel_futures=bool(exc))
-

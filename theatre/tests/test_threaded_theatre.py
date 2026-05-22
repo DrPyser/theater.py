@@ -13,9 +13,10 @@ from theatre.threaded_theatre import (
     drain,
     ErrorExit,
     NormalExit,
-    Receiving,
     ActorTerminated,
     MailboxFull,
+    Signal,
+    ActorSignaled,
 )
 import queue
 
@@ -227,18 +228,18 @@ def test_cancelled_init():
             theatre.run(main_actor)
 
 
-@pytest.mark.skip(reason="cancellation does not work for receive requests right now")
+# @pytest.mark.skip(reason="cancellation does not work for receive requests right now")
 def test_cancelled_request():
     def main_actor(*args):
         try:
             msg = yield receive()
-        except RequestCancelled as e:
-            assert isinstance(e.request, receive)
+        except ActorCancelled as e:
             yield Theatre.exit("cancelled_ok")
 
     with curtain_call() as theatre:
-        with theatre.spawn(main_actor) as addr:
-            theatre.cancel(addr)
+        addr = theatre.spawn(main_actor)
+        theatre.cancel(addr)
+        result = theatre.spotlight(addr)
         assert result == "cancelled_ok"
 
 
@@ -358,3 +359,16 @@ def test_mailbox_full_in_send_raises():
     with curtain_call(queue_size=2) as theatre:
         result = theatre.run(sender)
         assert result == "caught"
+
+
+def test_sigkill():
+    def blocker(*args):
+        yield receive(filter=lambda msg: False)
+        yield Theatre.exit("done")
+
+    with curtain_call() as theatre:
+        addr = theatre.spawn(blocker)
+        theatre.kill(addr)
+        with pytest.raises(ActorSignaled) as exc:
+            theatre.spotlight(addr)
+        assert exc.value.signal is Signal.KILL
