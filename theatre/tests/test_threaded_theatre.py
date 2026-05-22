@@ -183,7 +183,7 @@ def test_send_to_terminated_actor_caught():
 
     def sender(*args):
         doomed = yield spawn(target_actor)
-        yield Theatre.sleep(0.01)
+        yield Theatre.sleep(0.001)
         try:
             yield send(doomed, "test")
         except ActorTerminated:
@@ -254,7 +254,7 @@ def test_non_blocking_receive():
     def sender(*args):
         w1 = yield spawn(waiter, ("w1",))
         w2 = yield spawn(waiter, ("w2",))
-        yield Theatre.sleep(0.01)
+        yield Theatre.sleep(0.001)
         yield send(w1, "hello")
         yield send(w2, "world")
         yield Theatre.exit("done")
@@ -406,7 +406,7 @@ def test_link_trap_while_sleeping():
         yield link(addr)
         yield send(addr, "hello")
         try:
-            yield Theatre.sleep(0.5)
+            yield Theatre.sleep(5)
         except ActorTerminated as ex:
             assert ex.actor == addr
             assert ex.cause == NormalExit("done")
@@ -462,7 +462,7 @@ def test_fire_in_theatre_while_receive():
 def test_fire_in_theatre_while_sleep():
     def actor(*args):
         while True:
-            msg = yield Theatre.sleep(0.5)
+            msg = yield Theatre.sleep(5)
 
     with pytest.raises(Exception):
         with curtain_call() as theatre:

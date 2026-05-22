@@ -35,15 +35,44 @@ class RequestCancelled(Exception):
         self.req = req
 
 
+class CancellableTask:
+    __slots__ = ("_future", "_interrupt")
+
+    def __init__(self, future: Future, interrupt: threading.Event | None = None):
+        self._future = future
+        self._interrupt = interrupt
+
+    def cancel(self) -> bool:
+        if self._interrupt is not None:
+            self._interrupt.set()
+        return self._future.cancel()
+
+    def done(self) -> bool:
+        return self._future.done()
+
+    def cancelled(self) -> bool:
+        return self._future.cancelled()
+
+    def exception(self) -> BaseException | None:
+        return self._future.exception()
+
+    def result(self) -> Any:
+        return self._future.result()
+
+    @property
+    def future(self) -> Future:
+        return self._future
+
+
 ActorAddr = NewType("ActorAddr", int)
+
 
 class State:
     @dataclass
     class Init:
         """Actor initializing - executing code before first yield"""
 
-        future: Future
-
+        future: CancellableTask
 
     @dataclass
     class Waiting:
@@ -51,28 +80,24 @@ class State:
 
         request: object
 
-
     @dataclass
     class Awaiting:
         """Request dispatched, waiting for response_future to complete"""
 
         request: object
-        response_future: Future
-
+        response_future: CancellableTask
 
     @dataclass
     class Executing:
         """Request fulfilled, actor executing until next yield"""
 
-        future: Future
-
+        future: CancellableTask
 
     @dataclass
     class Terminated:
         """Actor finished execution"""
 
         cause: Exit | Signal
-
 
     @dataclass
     class Receiving:
@@ -291,23 +316,26 @@ class Theatre:
         addr = hash((script, props, next(self._counter)))
         return ActorAddr(addr)
 
-    def _submit_performance(self, addr, fn, *args):
-        print(f"submitting performance for actor {addr}: {fn.__qualname__}({args!r})")
+    def _submit_performance(self, addr, fn, *args, interrupt=None):
+        print(f"submitting performance for actor {addr}: {fn.__qualname__}{args!r}")
         fut = self.executor.submit(fn, *args)
         fut.add_done_callback(
             lambda f: self._events.put(Event.EndOfScene(actor=addr, future=f))
         )
-        return fut
+        return CancellableTask(future=fut, interrupt=interrupt)
 
-    def _submit_request(self, addr, request, fn, *args):
-        print(f"submitting request for actor {addr}: {request!r} ({fn.__qualname__})")
+    def _submit_request(self, addr, request, fn, *args, interrupt=None):
+        print(
+            f"submitting request for actor {addr}: {request!r} ({fn.__qualname__}{args})"
+        )
         fut = self.executor.submit(fn, *args)
+        task = CancellableTask(future=fut, interrupt=interrupt)
         fut.add_done_callback(
             lambda f: self._events.put(
-                Event.RequestCompleted(actor=addr, request=request, future=f)
+                Event.RequestCompleted(actor=addr, request=request, future=task)
             )
         )
-        return fut
+        return task
 
     def _create_actor(self, script, props):
         addr = self.make_addr(script, props)
@@ -453,11 +481,15 @@ class Theatre:
                         request=request, response_future=resp_future
                     )
             case Theatre.sleep(n):
-                # TODO: make this non-blocking/cancellable e.g. using cancellable threading.Timer
-                def delayed():
-                    time.sleep(n)
+                interrupt = threading.Event()
 
-                resp_future = self._submit_request(addr, request, delayed)
+                def delayed():
+                    if interrupt.wait(timeout=n):
+                        raise ActorCancelled(addr)
+
+                resp_future = self._submit_request(
+                    addr, request, delayed, interrupt=interrupt
+                )
                 play.states[addr] = State.Awaiting(
                     request=request, response_future=resp_future
                 )
