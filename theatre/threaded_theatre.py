@@ -133,6 +133,10 @@ class Event:
         signal: Signal
 
     @dataclass
+    class SignalAll:
+        signal: Signal
+
+    @dataclass
     class LinkTrap:
         linker: ActorAddr
         linked: ActorAddr
@@ -663,8 +667,14 @@ class Theatre:
                 result_future.set_result(address)
                 self._chain_transitions(address, play)
             case Event.Signal(actor, signal):
-                self._handle_signal(actor, signal, play)
-                self._chain_transitions(actor, play)
+                if not isinstance(play.states[actor], State.Terminated):
+                    self._handle_signal(actor, signal, play)
+                    self._chain_transitions(actor, play)
+            case Event.SignalAll(signal):
+                for actor in play.actors:
+                    if not isinstance(play.states[actor], State.Terminated):
+                        self._handle_signal(actor, signal, play)
+                        self._chain_transitions(actor, play)
             case Event.LinkTrap(linker, linked, future):
                 linker_sheet = play.actors[linker]
                 linker_state = play.states[linker]
@@ -851,12 +861,16 @@ class Theatre:
     def signal(self, actor: ActorAddr, signal: Signal):
         self._events.put(Event.Signal(actor, signal))
 
+    def signal_all(self, signal: Signal):
+        self._events.put(Event.SignalAll(signal))
+
     def __enter__(self):
         self._start()
         return self
 
     def __exit__(self, exc, typ, tb):
         if self._thread and self._thread.is_alive():
+            self.signal_all(Signal.INT)
             self._stop()
             self._thread.join()
         # cancel pending tasks if exception is raised
