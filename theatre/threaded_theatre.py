@@ -37,52 +37,60 @@ class RequestCancelled(Exception):
 
 ActorAddr = NewType("ActorAddr", int)
 
+class State:
+    @dataclass
+    class Init:
+        """Actor initializing - executing code before first yield"""
 
-@dataclass
-class Init:
-    """Actor initializing - executing code before first yield"""
-
-    future: Future
-
-
-@dataclass
-class Waiting:
-    """Actor yielded a request, not yet dispatched"""
-
-    request: object
+        future: Future
 
 
-@dataclass
-class Awaiting:
-    """Request dispatched, waiting for response_future to complete"""
+    @dataclass
+    class Waiting:
+        """Actor yielded a request, not yet dispatched"""
 
-    request: object
-    response_future: Future
-
-
-@dataclass
-class Executing:
-    """Request fulfilled, actor executing until next yield"""
-
-    future: Future
+        request: object
 
 
-@dataclass
-class Terminated:
-    """Actor finished execution"""
+    @dataclass
+    class Awaiting:
+        """Request dispatched, waiting for response_future to complete"""
 
-    result: object | None = None
-    error: Exception | None = None
-
-
-@dataclass
-class Receiving:
-    """Actor waiting for a message in mailbox"""
-
-    request: object
+        request: object
+        response_future: Future
 
 
-ActorState = Init | Waiting | Awaiting | Executing | Receiving | Terminated
+    @dataclass
+    class Executing:
+        """Request fulfilled, actor executing until next yield"""
+
+        future: Future
+
+
+    @dataclass
+    class Terminated:
+        """Actor finished execution"""
+
+        cause: Exit | Signal
+
+
+    @dataclass
+    class Receiving:
+        """Actor waiting for a message in mailbox"""
+
+        request: object
+
+
+ActorState = State.Init | State.Waiting | State.Awaiting | State.Executing | State.Receiving | State.Terminated
+
+
+class Signal(enum.Enum):
+    KILL = enum.auto()
+    INT = enum.auto()
+    TERM = enum.auto()
+
+    def __str__(self):
+        return f"SIG{self.name}"
 
 
 class Event:
@@ -129,6 +137,8 @@ class NormalExit:
 
 
 class ErrorExit(Exception):
+    __match_args__ = ("cause", "context")
+
     def __init__(self, cause, context=None):
         self.cause = cause
         self.context = context
@@ -146,9 +156,9 @@ class ActorCancelled(Exception):
 
 
 class ActorTerminated(Exception):
-    def __init__(self, actor: ActorAddr, exit: Exit):
+    def __init__(self, actor: ActorAddr, cause: Exit | Signal):
         self.actor = actor
-        self.exit = exit
+        self.cause = cause
 
 
 class MailboxFull(Exception):
@@ -286,30 +296,27 @@ class Theatre:
         match request:
             case Theatre.exit(value):
                 print(f"actor({addr}) terminated with value {value}")
-                play.states[addr] = Terminated(result=value)
+                play.states[addr] = State.Terminated(cause=NormalExit(value))
 
             case spawn(script, props):
                 child = self._spawn(script, props, play=play)
                 resp_future = Future()
                 resp_future.set_result(child)
-                play.states[addr] = Awaiting(
+                play.states[addr] = State.Awaiting(
                     request=request, response_future=resp_future
                 )
             case Theatre.self():
                 resp_future = Future()
                 resp_future.set_result(addr)
-                play.states[addr] = Awaiting(
+                play.states[addr] = State.Awaiting(
                     request=request, response_future=resp_future
                 )
             case send(dest_addr, msg):
                 resp_future = Future()
                 if destination := play.actors.get(dest_addr):
                     match play.states[dest_addr]:
-                        case Terminated(result=result, error=error):
-                            resp_future.set_exception(ActorTerminated(
-                                dest_addr,
-                                ErrorExit(error) if error else NormalExit(result)
-                            ))
+                        case State.Terminated(cause=cause):
+                            resp_future.set_exception(ActorTerminated(dest_addr, cause))
                         case _:
                             try:
                                 destination.mailbox.append(msg)
@@ -322,7 +329,7 @@ class Theatre:
                                 resp_future.set_result(None)
                 else:
                     resp_future.set_exception(DestinationNotFound(dest_addr))
-                play.states[addr] = Awaiting(
+                play.states[addr] = State.Awaiting(
                     request=request, response_future=resp_future
                 )
             case receive(filter=filter_fn):
@@ -330,12 +337,12 @@ class Theatre:
                     msg = sheet.mailbox.pop_matching(filter_fn)
                 except _NoMatch:
                     print(f"Parking actor({addr}) on receive request ({request})")
-                    play.states[addr] = Receiving(request=request)
+                    play.states[addr] = State.Receiving(request=request)
                 else:
                     print(f"actor({addr}) request {request} satisfied directly: {msg}")
                     resp_future = Future()
                     resp_future.set_result(msg)
-                    play.states[addr] = Awaiting(
+                    play.states[addr] = State.Awaiting(
                         request=request, response_future=resp_future
                     )
             case Theatre.sleep(n):
@@ -344,7 +351,7 @@ class Theatre:
                     time.sleep(n)
 
                 resp_future = self._submit_request(addr, request, delayed)
-                play.states[addr] = Awaiting(
+                play.states[addr] = State.Awaiting(
                     request=request, response_future=resp_future
                 )
             case _:
@@ -352,7 +359,7 @@ class Theatre:
                 future = self._submit_performance(
                     addr, sheet.play.throw, UnsupportedRequest(addr, request)
                 )
-                play.states[addr] = Executing(future=future)
+                play.states[addr] = State.Executing(future=future)
 
     def _process_state(self, addr: ActorAddr, play: Play) -> bool:
         if addr not in play.states:
@@ -361,30 +368,30 @@ class Theatre:
         sheet = play.actors[addr]
 
         match state:
-            case Init(future) if future.done():
+            case State.Init(future) if future.done():
                 try:
                     req = future.result()
                 except StopIteration as ex:
-                    play.states[addr] = Terminated(result=ex.value)
+                    play.states[addr] = State.Terminated(cause=NormalExit(ex.value))
                     print(f"actor {addr} terminated during init with value {ex.value}")
                 except CancelledError as ex:
                     print(f"actor {addr} cancelled during init")
                     wrap = ActorCancelled(addr)
                     wrap.__cause__ = wrap.__context__ = ex
-                    play.states[addr] = Terminated(error=wrap)
+                    play.states[addr] = State.Terminated(cause=ErrorExit(wrap))
                 except Exception as ex:
-                    play.states[addr] = Terminated(error=ex)
+                    play.states[addr] = State.Terminated(cause=ErrorExit(ex))
                     print(f"actor {addr} died during init: {ex}")
                 else:
-                    play.states[addr] = Waiting(request=req)
+                    play.states[addr] = State.Waiting(request=req)
                     print(f"actor {addr} initialized, pending request {req}")
                 return True
 
-            case Waiting(request=req):
+            case State.Waiting(request=req):
                 self._handle_request(addr, req, play)
                 return True
 
-            case Awaiting(request=req, response_future=fut) if fut.done():
+            case State.Awaiting(request=req, response_future=fut) if fut.done():
                 print(f"actor({addr}) request({req}) response ready")
                 if fut.cancelled():
                     print(f"actor({addr}) request({req}) cancelled")
@@ -402,47 +409,47 @@ class Theatre:
                         addr, sheet.play.send, fut.result()
                     )
 
-                play.states[addr] = Executing(future=exec_future)
+                play.states[addr] = State.Executing(future=exec_future)
                 return True
 
-            case Executing(future=fut) if fut.done():
+            case State.Executing(future=fut) if fut.done():
                 try:
                     req = fut.result()
                 except StopIteration as ex:
-                    play.states[addr] = Terminated(result=ex.value)
+                    play.states[addr] = State.Terminated(cause=NormalExit(ex.value))
                     print(f"actor {addr} terminated with value {ex.value}")
                 except Exception as ex:
-                    play.states[addr] = Terminated(error=ex)
+                    play.states[addr] = State.Terminated(cause=ErrorExit(ex))
                     print(f"actor {addr} died: {ex}")
                 else:
-                    play.states[addr] = Waiting(request=req)
+                    play.states[addr] = State.Waiting(request=req)
                     print(f"actor {addr} now pending request {req}")
                 return True
 
-            case Executing(future=fut):
+            case State.Executing(future=fut):
                 print(f"actor({addr}) still executing (future {fut})")
                 return False
 
-            case Receiving(request=request):
+            case State.Receiving(request=request):
                 print(f"actor ({addr}) still in Receiving state for request {request=}")
                 return False
 
-            case Terminated(result=result, error=error):
-                if play.protagonist and addr == play.protagonist:
-                    if error:
-                        print(
-                            f"protagonist ({addr}) terminated with error"
-                        )
-                        play.protagonist_result.set_exception(error)
-                    else:
-                        print(
-                            f"protagonist ({addr}) terminated with success"
-                        )
-                        play.protagonist_result.set_result(result)
-                if error:
-                    print(f"actor {addr} is terminated with error: {error}")
-                else:
-                    print(f"actor {addr} is terminated with value {result}")
+            case State.Terminated(cause=cause):
+                match cause:
+                    case ErrorExit(error):
+                        if play.protagonist and addr == play.protagonist:
+                            play.protagonist_result.set_exception(error)
+                        print(f"actor {addr} terminated with error: {error}")
+                    case NormalExit(value):
+                        print(f"actor {addr} terminated with value {value}")
+                        if play.protagonist and addr == play.protagonist:
+                            play.protagonist_result.set_result(value)
+                    case Signal():
+                        print(f"actor({addr}) terminated with signal {cause}")
+                        if play.protagonist and addr == play.protagonist:
+                            play.protagonist_result.set_exception(
+                                ActorSignaled(addr, cause)
+                            )
                 # TODO: handle terminated actors (links, cleanup)
                 return False
 
@@ -473,7 +480,7 @@ class Theatre:
                     return
                 actor_state = play.states[actor]
                 match actor_state:
-                    case Executing(future=fut) | Init(future=fut):
+                    case State.Executing(future=fut) | State.Init(future=fut):
                         assert future.done()
                         if future is not fut:
                             print(
@@ -481,7 +488,7 @@ class Theatre:
                             )
                         self._chain_transitions(actor, play)
                         return
-                    case Receiving():
+                    case State.Receiving():
                         # already transitioned to Receiving state from receive request
                         pass
                     case state:
@@ -495,7 +502,7 @@ class Theatre:
                     return
                 actor_state = play.states[actor]
                 match actor_state:
-                    case Awaiting(request=req, response_future=fut):
+                    case State.Awaiting(request=req, response_future=fut):
                         assert future.done()
                         if req is not request or fut is not future:
                             print(
@@ -513,7 +520,7 @@ class Theatre:
                     return
                 actor_state = play.states[actor]
                 match actor_state:
-                    case Receiving(request=request):
+                    case State.Receiving(request=request):
                         sheet = play.actors[actor]
                         filter_fn = (
                             request.filter if isinstance(request, receive) else None
@@ -529,7 +536,7 @@ class Theatre:
                             print(f"actor({actor}) request({request}) satisfied: {msg}")
                             resp_future = Future()
                             resp_future.set_result(msg)
-                            play.states[actor] = Awaiting(
+                            play.states[actor] = State.Awaiting(
                                 request=request, response_future=resp_future
                             )
                             self._chain_transitions(actor, play)
@@ -620,10 +627,8 @@ class Theatre:
         play = play or self._play
         sheet = self._create_actor(script, props)
         play.actors[sheet.address] = sheet
-        play.states[sheet.address] = Init(
-            future=self._submit_performance(
-                sheet.address, sheet.play.send, None
-            )
+        play.states[sheet.address] = State.Init(
+            future=self._submit_performance(sheet.address, sheet.play.send, None)
         )
         if protagonist:
             play.protagonist = sheet.address
@@ -665,12 +670,13 @@ class Theatre:
         future = Future()
         self._events.put(
             Event.RegisterCondition(
-                predicate=lambda play: all(isinstance(state, Terminated) for state in play.states.values()),
+                predicate=lambda play: all(
+                    isinstance(state, State.Terminated) for state in play.states.values()
+                ),
                 projection=lambda play: [
-                    (addr, ErrorExit(state.error) if state.error else NormalExit(state.result))
-                    for addr, state in play.states.items()
+                    (addr, state.cause) for addr, state in play.states.items()
                 ],
-                future=future
+                future=future,
             )
         )
         return future.result()
@@ -680,13 +686,11 @@ class Theatre:
         future = Future()
         self._events.put(
             Event.RegisterCondition(
-                predicate=lambda play: actor in play.states and isinstance(play.states[actor], Terminated),
-                projection=lambda play: (
-                    ErrorExit(play.states[actor].error)
-                    if play.states[actor].error
-                    else NormalExit(play.states[actor].result)
+                predicate=lambda play: (
+                    actor in play.states and isinstance(play.states[actor], State.Terminated)
                 ),
-                future=future
+                projection=lambda play: play.states[actor].cause,
+                future=future,
             )
         )
         match future.result():
