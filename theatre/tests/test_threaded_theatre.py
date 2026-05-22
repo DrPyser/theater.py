@@ -270,7 +270,7 @@ def test_theatre_spawn_and_spotlight():
         yield send(address, "hello")
 
     with curtain_call() as theatre:
-        waiter_address = theatre.spawn(waiter, protagonist=True)
+        waiter_address = theatre.spawn(waiter)
         theatre.spawn(replier, waiter_address)
         result = theatre.spotlight(waiter_address)
         assert result == "hello"

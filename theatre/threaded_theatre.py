@@ -499,19 +499,11 @@ class Theatre:
             case State.Terminated(cause=cause):
                 match cause:
                     case ErrorExit(error):
-                        if play.protagonist and addr == play.protagonist:
-                            play.protagonist_result.set_exception(error)
                         print(f"actor {addr} terminated with error: {error}")
                     case NormalExit(value):
                         print(f"actor {addr} terminated with value {value}")
-                        if play.protagonist and addr == play.protagonist:
-                            play.protagonist_result.set_result(value)
                     case Signal():
                         print(f"actor({addr}) terminated with signal {cause}")
-                        if play.protagonist and addr == play.protagonist:
-                            play.protagonist_result.set_exception(
-                                ActorSignaled(addr, cause)
-                            )
                 # TODO: handle terminated actors (links, cleanup)
                 return False
 
@@ -610,9 +602,9 @@ class Theatre:
                         pass
             case Event.RegisterCondition(predicate=pred, projection=proj, future=fut):
                 self._play.conditions.append(event)
-            case Event.SpawnRequested(script, props, protagonist, result_future):
+            case Event.SpawnRequested(script, props, result_future):
                 address = self._spawn(
-                    script=script, props=props, protagonist=protagonist
+                    script=script, props=props
                 )
                 result_future.set_result(address)
                 self._chain_transitions(address, play)
@@ -679,7 +671,7 @@ class Theatre:
                 for condition in triggered_conditions:
                     self._play.conditions.remove(condition)
 
-            print(f"Terminating play: {stop=} {self._play.protagonist_result=}")
+            print(f"Terminating play: {stop=}")
         except BaseException as ex:
             print(f"Theatre run loop raised exception: {ex}")
             print_exc()
@@ -697,28 +689,22 @@ class Theatre:
         print(f"Starting run loop thread {self._thread=}")
         self._thread.start()
 
-    def _spawn(self, script: Actor, props: tuple, play=None, protagonist=False):
-        print(f"Processing spawn request {script=} {props=} {protagonist=}")
+    def _spawn(self, script: Actor, props: tuple, play=None):
+        print(f"Processing spawn request {script=} {props=}")
         play = play or self._play
         sheet = self._create_actor(script, props)
         play.actors[sheet.address] = sheet
         play.states[sheet.address] = State.Init(
             future=self._submit_performance(sheet.address, sheet.play.send, None)
         )
-        if protagonist:
-            play.protagonist = sheet.address
-            play.protagonist_result = Future()
-            print(f"Protagonist introduced to play {play.protagonist}")
-
         return sheet.address
 
-    def spawn(self, script, *props, protagonist=False):
+    def spawn(self, script, *props):
         assert self._thread.is_alive()
         result_future = Future()
         event = Event.SpawnRequested(
             script=script,
             props=props,
-            protagonist=protagonist,
             result_future=result_future,
         )
         self._events.put(event)
@@ -729,17 +715,13 @@ class Theatre:
     def run(self, protagonist: Actor, *props):
         if not (self._thread and self._thread.is_alive()):
             raise RuntimeError("No running run loop thread!")
-        if self._play.protagonist_result is not None:
-            raise RuntimeError("A run is already in progress")
 
-        protagonist_address = self.spawn(protagonist, *props, protagonist=True)
+        protagonist_address = self.spawn(protagonist, *props)
 
         return self.spotlight(protagonist_address)
 
     def wait_ensemble(self):
         # wait for all actors to terminate
-        # TODO: generic mechanism for waiting conditions
-        # & signaling based on actors states
         future = Future()
         self._events.put(
             Event.RegisterCondition(
