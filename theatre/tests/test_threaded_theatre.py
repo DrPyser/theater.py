@@ -14,7 +14,8 @@ from theatre.threaded_theatre import (
     ErrorExit,
     NormalExit,
     Receiving,
-    ActorTerminated
+    ActorTerminated,
+    MailboxFull,
 )
 import queue
 
@@ -296,3 +297,64 @@ def test_theatre_wait_ensemble():
             else:
                 assert addr == replier_addr
                 assert res == NormalExit(None)
+
+
+def test_selective_receive():
+    def worker(me):
+        yield send(me, "ping")
+        yield send(me, "pong")
+        yield send(me, "ping")
+        yield Theatre.exit("ok")
+
+    def main_actor(*args):
+        me = yield Theatre.self()
+        child = yield spawn(worker, (me,))
+        msg = yield receive(filter=lambda m: m == "pong")
+        assert msg == "pong"
+        remaining1 = yield receive()
+        assert remaining1 == "ping"
+        remaining2 = yield receive()
+        assert remaining2 == "ping"
+        yield Theatre.exit("ok")
+
+    with curtain_call() as theatre:
+        result = theatre.run(main_actor)
+        assert result == "ok"
+
+
+def test_selective_receive_no_match_parks():
+    def worker(me):
+        msg = yield receive(filter=lambda m: m == "special")
+        yield Theatre.exit(msg)
+
+    def main_actor(*args):
+        me = yield Theatre.self()
+        child = yield spawn(worker, (me,))
+        yield send(me, "noise")  # noise to main, worker stays parked
+        yield send(child, "special")  # now worker matches
+        msg = yield receive()
+        assert msg == "noise"
+        yield Theatre.exit("done")
+
+    with curtain_call() as theatre:
+        result = theatre.run(main_actor)
+        assert result == "done"
+
+
+def test_mailbox_full_in_send_raises():
+    def sender(*args):
+        doomed = yield spawn(filler)
+        yield send(doomed, "x")
+        yield send(doomed, "y")
+        try:
+            yield send(doomed, "overflow")
+        except MailboxFull:
+            yield Theatre.exit("caught")
+
+    def filler(*args):
+        yield receive(filter=lambda msg: msg == "z")
+        yield Theatre.exit("done")
+
+    with curtain_call(queue_size=2) as theatre:
+        result = theatre.run(sender)
+        assert result == "caught"

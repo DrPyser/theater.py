@@ -1,6 +1,8 @@
-from theatre.interfaces import receive, Actor, Exit, ActorSheet, send, spawn
 import threading
 import queue
+import enum
+import time
+import itertools
 from concurrent.futures import (
     ThreadPoolExecutor,
     Future,
@@ -8,14 +10,13 @@ from concurrent.futures import (
     CancelledError,
     Executor,
 )
-import itertools
 from collections import deque
 from collections.abc import Iterator
 from contextvars import copy_context
 from typing import NewType, Any, Callable
 from dataclasses import dataclass, field
-import time
 from traceback import print_exc
+from theatre.interfaces import receive, Actor, Exit, ActorSheet, send, spawn
 
 
 def create_actor_sheet(actor_script, props, addr, mailbox):
@@ -149,6 +150,46 @@ class ActorTerminated(Exception):
         self.actor = actor
         self.exit = exit
 
+
+class MailboxFull(Exception):
+    pass
+
+
+class _NoMatch(Exception):
+    pass
+
+
+class Mailbox:
+    def __init__(self, maxlen: int):
+        self._items: deque[Any] = deque(maxlen=maxlen)
+        self._maxlen: int = maxlen
+
+    def append(self, msg: Any) -> None:
+        if len(self._items) >= self._maxlen:
+            raise MailboxFull()
+        self._items.append(msg)
+
+    def pop_matching(self, filter_fn: Callable[[Any], bool] | None = None) -> Any:
+        if filter_fn is None:
+            if self._items:
+                return self._items.popleft()
+            raise _NoMatch()
+        for i, msg in enumerate(self._items):
+            if filter_fn(msg):
+                del self._items[i]
+                return msg
+        raise _NoMatch()
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __bool__(self) -> bool:
+        return bool(self._items)
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self._items)
+
+
 class UnsupportedRequest(Exception):
     def __init__(self, actor: ActorAddr, req: Any):
         self.actor = actor
@@ -234,7 +275,7 @@ class Theatre:
 
     def _create_actor(self, script, props):
         addr = self.make_addr(script, props)
-        mailbox = lambda: queue.Queue(self.queue_size)
+        mailbox = lambda: Mailbox(maxlen=self.queue_size)
         sheet = create_actor_sheet(script, props, addr, mailbox)
         return sheet
 
@@ -270,20 +311,28 @@ class Theatre:
                                 ErrorExit(error) if error else NormalExit(result)
                             ))
                         case _:
-                            destination.mailbox.put(msg)
-                            self._events.put(Event.MessageDelivered(actor=dest_addr))
-                            resp_future.set_result(None)
+                            try:
+                                destination.mailbox.append(msg)
+                            except MailboxFull as ex:
+                                resp_future.set_exception(ex)
+                            else:
+                                self._events.put(
+                                    Event.MessageDelivered(actor=dest_addr)
+                                )
+                                resp_future.set_result(None)
                 else:
                     resp_future.set_exception(DestinationNotFound(dest_addr))
                 play.states[addr] = Awaiting(
                     request=request, response_future=resp_future
                 )
-            case receive():
+            case receive(filter=filter_fn):
                 try:
-                    msg = sheet.mailbox.get_nowait()
-                except queue.Empty:
+                    msg = sheet.mailbox.pop_matching(filter_fn)
+                except _NoMatch:
+                    print(f"Parking actor({addr}) on receive request ({request})")
                     play.states[addr] = Receiving(request=request)
                 else:
+                    print(f"actor({addr}) request {request} satisfied directly: {msg}")
                     resp_future = Future()
                     resp_future.set_result(msg)
                     play.states[addr] = Awaiting(
@@ -466,14 +515,26 @@ class Theatre:
                 match actor_state:
                     case Receiving(request=request):
                         sheet = play.actors[actor]
-                        msg = sheet.mailbox.get_nowait()
-                        resp_future = Future()
-                        resp_future.set_result(msg)
-                        play.states[actor] = Awaiting(
-                            request=request, response_future=resp_future
+                        filter_fn = (
+                            request.filter if isinstance(request, receive) else None
                         )
-                        self._chain_transitions(actor, play)
+                        try:
+                            msg = sheet.mailbox.pop_matching(filter_fn)
+                        except _NoMatch:
+                            print(
+                                f"actor({actor}) request({request}) still insatisfied"
+                            )
+                            pass
+                        else:
+                            print(f"actor({actor}) request({request}) satisfied: {msg}")
+                            resp_future = Future()
+                            resp_future.set_result(msg)
+                            play.states[actor] = Awaiting(
+                                request=request, response_future=resp_future
+                            )
+                            self._chain_transitions(actor, play)
                     case _:
+                        print(f"actor({actor}) not in Receiving state")
                         pass
             case Event.RegisterCondition(predicate=pred, projection=proj, future=fut):
                 self._play.conditions.append(event)
