@@ -41,42 +41,59 @@ class Exit(Exception):
     pass
 
 
-@dataclass
-class send(Generic[T]):
-    address: Address
-    message: T
+class System:
+    @dataclass
+    class exit:
+        value: Any = None
+
+    @dataclass
+    class whoami:
+        pass
+
+    @dataclass
+    class sleep:
+        duration: float
 
 
-@dataclass
-class receive(Generic[T]):
-    filter: Callable[[T], bool] | None = None
-    timeout: float | None = None
+    @dataclass
+    class send(Generic[T]):
+        address: Address
+        message: T
 
 
-@dataclass
-class select(Generic[T]):
-    predicates: list[Callable[[T], bool]]
+    @dataclass
+    class receive(Generic[T]):
+        filter: Callable[[T], bool] | None = None
+        timeout: float | None = None
 
 
-@dataclass
-class spawn(Generic[PropsT]):
-    script: Script
-    props: PropsT = ()
+    @dataclass
+    class select(Generic[T]):
+        predicates: list[Callable[[T], bool]]
 
 
-@dataclass
-class spawn_link(Generic[PropsT]):
-    script: Script
-    props: PropsT
+    @dataclass
+    class spawn(Generic[PropsT]):
+        script: Script
+        props: PropsT = ()
 
 
-@dataclass
-class kill:
-    address: Address
-    reason: object | None = None
+    @dataclass
+    class link:
+        target: Address
 
 
-SystemCall = send[Any] | receive | select[Any] | spawn[Any] | spawn_link[Any] | kill
+    @dataclass
+    class spawn_link(Generic[PropsT]):
+        script: Script
+        props: PropsT = ()
+
+
+    @dataclass
+    class kill:
+        address: Address
+        reason: object | None = None
+
 
 SystemT = TypeVar("SystemT")
 Actor = Generator[SystemT, ResponseT, None]

@@ -16,7 +16,9 @@ from contextvars import copy_context
 from typing import NewType, Any, Callable
 from dataclasses import dataclass, field
 from traceback import print_exc
-from theatre.interfaces import receive, Actor, Exit, ActorSheet, send, spawn
+from theatre.interfaces import (
+    Actor, Exit, ActorSheet, System
+)
 
 
 def create_actor_sheet(actor_script, props, addr, mailbox):
@@ -303,29 +305,7 @@ class Play:
     conditions: list[Event.RegisterCondition] = field(default_factory=list)
 
 
-@dataclass
-class link:
-    target: ActorAddr
-
-
-@dataclass
-class spawn_link(spawn):
-    pass
-
-
 class Theatre:
-    @dataclass
-    class self:
-        pass
-
-    @dataclass
-    class sleep:
-        duration: float
-
-    @dataclass
-    class exit:
-        value: Any = None
-
     def __init__(self, executor: Executor, queue_size=1024, clock_tick=1, max_idle=None):
         self._counter = itertools.count()
         self.queue_size = queue_size
@@ -466,10 +446,10 @@ class Theatre:
         sheet = play.actors[addr]
 
         match request:
-            case Theatre.exit(value):
+            case System.exit(value):
                 print(f"actor({addr}) terminated with value {value}")
                 play.states[addr] = State.Terminated(cause=NormalExit(value))
-            case spawn_link(script, props):
+            case System.spawn_link(script, props):
                 child = self._spawn(script, props, play=play)
                 self._link(addr, child, play)
                 resp_future = Future()
@@ -477,20 +457,20 @@ class Theatre:
                 play.states[addr] = State.Awaiting(
                     request=request, response_future=resp_future
                 )
-            case spawn(script, props):
+            case System.spawn(script, props):
                 child = self._spawn(script, props, play=play)
                 resp_future = Future()
                 resp_future.set_result(child)
                 play.states[addr] = State.Awaiting(
                     request=request, response_future=resp_future
                 )
-            case Theatre.self():
+            case System.whoami():
                 resp_future = Future()
                 resp_future.set_result(addr)
                 play.states[addr] = State.Awaiting(
                     request=request, response_future=resp_future
                 )
-            case send(dest_addr, msg):
+            case System.send(dest_addr, msg):
                 resp_future = Future()
                 if destination := play.actors.get(dest_addr):
                     match play.states[dest_addr]:
@@ -511,7 +491,7 @@ class Theatre:
                 play.states[addr] = State.Awaiting(
                     request=request, response_future=resp_future
                 )
-            case receive(filter=filter_fn, timeout=timeout):
+            case System.receive(filter=filter_fn, timeout=timeout):
                 try:
                     msg = sheet.mailbox.pop_matching(filter_fn)
                 except _NoMatch:
@@ -526,8 +506,11 @@ class Theatre:
 
                         def delayed():
                             if interrupt.wait(timeout=timeout):
-                                if not interrupt.is_set():
-                                    raise ReceiveTimeout(request)
+                                # interrupt was set, timeout was cancelled
+                                return
+                            else:
+                                # interrupt was not set, wait terminated by timeout
+                                raise ReceiveTimeout(request)
 
                         fut = self.executor.submit(delayed)
                         timeout_task = CancellableTask(future=fut, interrupt=interrupt)
@@ -536,7 +519,6 @@ class Theatre:
                         # event handler should check that actor is still in Receiving state
                         # and handling MessageReceived should cancel corresponding timeout task
                         def timeout_callback(f):
-                            # if not f.cancelled() and isinstance(f.exception(), ReceiveTimeout):
                             print(f"Receive timeout triggered ({f.cancelled()=},{f.exception()=})")
                             if not (interrupt.is_set() or f.cancelled()):
                                 self._events.put(
@@ -558,7 +540,7 @@ class Theatre:
                     play.states[addr] = State.Awaiting(
                         request=request, response_future=resp_future
                     )
-            case Theatre.sleep(n):
+            case System.sleep(n):
                 interrupt = threading.Event()
 
                 def delayed():
@@ -571,7 +553,7 @@ class Theatre:
                 play.states[addr] = State.Awaiting(
                     request=request, response_future=resp_future
                 )
-            case link(target=actor):
+            case System.link(target=actor):
                 if actor not in play.states:
                     # target actor does not exist
                     future = self._submit_performance(
@@ -765,7 +747,7 @@ class Theatre:
                             )
                             return
                         filter_fn = (
-                            request.filter if isinstance(request, receive) else None
+                            request.filter if isinstance(request, System.receive) else None
                         )
                         try:
                             msg = sheet.mailbox.pop_matching(filter_fn)
@@ -913,9 +895,11 @@ class Theatre:
             loop_count = itertools.count()
             idle_count = 0
             stop = False
+            stop_idle = False
             while not stop:
                 if self.max_idle and idle_count >= self.max_idle:
                     print(f"Reached max idle count ({self.max_idle=}), stopping")
+                    stop_idle = True
                     break
                 cnt = next(loop_count)
                 print(f"Running main loop ({cnt})")
@@ -951,7 +935,8 @@ class Theatre:
 
             print(f"Terminating play: {stop=} {idle_count=}")
             for condition in self._play.conditions:
-                if idle_count >= self.max_idle:
+                if stop_idle:
+                    assert self.max_idle and idle_count >= self.max_idle
                     condition.future.set_exception(MaxIdleException(idle_count, self.max_idle))
                 elif stop:
                     condition.future.set_exception(Event.Stop())
