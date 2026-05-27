@@ -23,7 +23,7 @@ def create_actor_sheet(actor_script, props, addr, mailbox):
     return ActorSheet(
         address=addr,
         script=actor_script,
-        play=actor_script(*props),
+        performance=actor_script(*props),
         props=props,
         mailbox=mailbox(),
         context=copy_context(),
@@ -437,7 +437,7 @@ class Theatre:
                         if tfut:
                             tfut.cancel()
                         exec_future = self._submit_performance(
-                            actor, sheet.play.throw, ActorCancelled(actor)
+                            actor, sheet.performance.throw, ActorCancelled(actor)
                         )
                         play.states[actor] = State.Executing(exec_future)
                     case (
@@ -447,7 +447,7 @@ class Theatre:
                     ):
                         future.cancel()
                         exec_future = self._submit_performance(
-                            actor, sheet.play.throw, ActorCancelled(actor)
+                            actor, sheet.performance.throw, ActorCancelled(actor)
                         )
                         play.states[actor] = State.Executing(exec_future)
                     case state:
@@ -455,7 +455,7 @@ class Theatre:
                             f"actor({actor}) received SIGINT while in state {state}; scheduling signal handling opportunity"
                         )
                         exec_future = self._submit_performance(
-                            actor, sheet.play.throw, ActorCancelled(actor)
+                            actor, sheet.performance.throw, ActorCancelled(actor)
                         )
                         play.states[actor] = State.Executing(exec_future)
             case _:
@@ -575,17 +575,17 @@ class Theatre:
                 if actor not in play.states:
                     # target actor does not exist
                     future = self._submit_performance(
-                        addr, sheet.play.throw, DestinationNotFound(actor)
+                        addr, sheet.performance.throw, DestinationNotFound(actor)
                     )
                     play.states[addr] = State.Executing(future=future)
                 else:
                     self._link(addr, actor, play)
-                    future = self._submit_performance(addr, sheet.play.send, None)
+                    future = self._submit_performance(addr, sheet.performance.send, None)
                     play.states[addr] = State.Executing(future=future)
             case _:
                 print(f"unexpected request {request}")
                 future = self._submit_performance(
-                    addr, sheet.play.throw, UnsupportedRequest(addr, request)
+                    addr, sheet.performance.throw, UnsupportedRequest(addr, request)
                 )
                 play.states[addr] = State.Executing(future=future)
 
@@ -624,17 +624,17 @@ class Theatre:
                 if fut.cancelled():
                     print(f"actor({addr}) request({req}) cancelled")
                     exec_future = self._submit_performance(
-                        addr, sheet.play.throw, RequestCancelled(req)
+                        addr, sheet.performance.throw, RequestCancelled(req)
                     )
                 elif exception := fut.exception():
                     print(f"actor({addr}) request({req}) failed: {exception}")
                     exec_future = self._submit_performance(
-                        addr, sheet.play.throw, exception
+                        addr, sheet.performance.throw, exception
                     )
                 else:
                     print(f"actor({addr}) request({req}) succeeded")
                     exec_future = self._submit_performance(
-                        addr, sheet.play.send, fut.result()
+                        addr, sheet.performance.send, fut.result()
                     )
 
                 play.states[addr] = State.Executing(future=exec_future)
@@ -827,7 +827,7 @@ class Theatre:
                                 print(
                                     f"actor({linker}): ignoring request {req} to signal link trap from {linked}"
                                 )
-                                linker_sheet.play.throw(
+                                linker_sheet.performance.throw(
                                     ActorTerminated(linked, future.result())
                                 )
 
@@ -840,14 +840,14 @@ class Theatre:
                         fut.cancel()
                         exec_future = self._submit_performance(
                             linker,
-                            linker_sheet.play.throw,
+                            linker_sheet.performance.throw,
                             ActorTerminated(linked, future.result()),
                         )
                         play.states[linker] = State.Executing(exec_future)
                     case _:
                         exec_future = self._submit_performance(
                             linker,
-                            linker_sheet.play.throw,
+                            linker_sheet.performance.throw,
                             ActorTerminated(linked, future.result()),
                         )
                         play.states[linker] = State.Executing(exec_future)
@@ -868,7 +868,7 @@ class Theatre:
                         print(f"actor({actor}): receive request {req} timed out")
                         exec_future = self._submit_performance(
                             actor,
-                            sheet.play.throw,
+                            sheet.performance.throw,
                             ReceiveTimeout(request=req),
                         )
                         play.states[actor] = State.Executing(exec_future)
@@ -980,7 +980,7 @@ class Theatre:
         sheet = self._create_actor(script, props)
         play.actors[sheet.address] = sheet
         play.states[sheet.address] = State.Init(
-            future=self._submit_performance(sheet.address, sheet.play.send, None)
+            future=self._submit_performance(sheet.address, sheet.performance.send, None)
         )
         return sheet.address
 

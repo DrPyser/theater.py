@@ -7,6 +7,7 @@ from typing import (
     Coroutine,
     Generator,
     Any,
+    Iterable,
 )
 from dataclasses import dataclass
 from contextvars import Context, ContextVar
@@ -21,14 +22,12 @@ AddressingScheme = Callable[..., Address]
 MessageT = TypeVar("MessageT")
 
 
-class Queue(Protocol[MessageT]):
-    def put(self, message: MessageT) -> None: ...
-    def get(self) -> MessageT: ...
+class Mailbox(Iterable, Protocol):
+    def append(self, msg: Any) -> None:
+        ...
 
-
-Inbox = Queue
-Outbox = Queue
-Mailbox = Queue
+    def pop_matching(self, filter_fn: Callable[[Any], bool] | None = None) -> Any:
+        ...
 
 PropsT = TypeVar("PropsT")
 Script = Callable[[PropsT], Coroutine]
@@ -106,7 +105,7 @@ class ActorContext:
 class ActorSheet(Generic[PropsT]):
     address: Address
     script: Script[PropsT]
-    play: Coroutine
+    performance: Coroutine
     props: PropsT
-    mailbox: Inbox
+    mailbox: Mailbox
     context: Context
