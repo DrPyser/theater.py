@@ -490,6 +490,54 @@ def test_receive_with_timeout():
     assert threading.active_count() == 1
 
 
+def test_sleep_interrupted_by_sigint():
+    def sleeper(*args):
+        try:
+            yield Theatre.sleep(60)
+        except ActorCancelled:
+            yield Theatre.exit("interrupted")
+
+    with curtain_call() as theatre:
+        addr = theatre.spawn(sleeper)
+        time.sleep(0.05)
+        theatre.cancel(addr)
+        result = theatre.spotlight(addr)
+        assert result == "interrupted"
+
+
+def test_sleep_interrupted_by_sigkill():
+    def sleeper(*args):
+        yield Theatre.sleep(60)
+
+    with curtain_call() as theatre:
+        addr = theatre.spawn(sleeper)
+        time.sleep(0.05)
+        theatre.kill(addr)
+        with pytest.raises(ActorSignaled) as exc:
+            theatre.spotlight(addr)
+        assert exc.value.signal is Signal.KILL
+
+
+def test_signal_all_interrupts_sleep():
+    N = 3
+
+    def sleeper(*args):
+        try:
+            yield Theatre.sleep(60)
+        except ActorCancelled:
+            yield Theatre.exit("interrupted")
+
+    with curtain_call() as theatre:
+        addrs = [theatre.spawn(sleeper) for _ in range(N)]
+        time.sleep(0.05)
+        theatre.signal_all(Signal.INT)
+        results = theatre.wait_ensemble()
+        for addr, cause in results:
+            if addr in addrs:
+                assert isinstance(cause, NormalExit)
+                assert cause.value == "interrupted"
+
+
 def test_receive_timeout_interrupted_by_sigint():
     def actor(*args):
         try:
@@ -503,6 +551,19 @@ def test_receive_timeout_interrupted_by_sigint():
         theatre.cancel(addr)
         result = theatre.spotlight(addr)
         assert result == "cancelled"
+
+
+def test_sigint_on_terminated_actor_is_noop():
+    def actor(*args):
+        yield Theatre.exit("done")
+
+    with curtain_call() as theatre:
+        addr = theatre.spawn(actor)
+        result = theatre.spotlight(addr)
+        assert result == "done"
+        theatre.cancel(addr)
+        result2 = theatre.spotlight(addr)
+        assert result2 == "done"
 
 
 def test_receive_timeout_cancelled_on_message():
