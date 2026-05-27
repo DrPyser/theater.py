@@ -34,6 +34,11 @@ class RequestCancelled(Exception):
     def __init__(self, req):
         self.req = req
 
+class MaxIdleException(Exception):
+    def __init__(self, idle_count, max_idle):
+        self.idle_count = idle_count
+        self.max_idle = max_idle
+
 
 class CancellableTask:
     __slots__ = ("_future", "_interrupt")
@@ -321,12 +326,13 @@ class Theatre:
     class exit:
         value: Any = None
 
-    def __init__(self, executor: Executor, queue_size=1024, clock_tick=1):
+    def __init__(self, executor: Executor, queue_size=1024, clock_tick=1, max_idle=None):
         self._counter = itertools.count()
         self.queue_size = queue_size
         self.executor = executor
         self.clock_tick = clock_tick
         self._events = queue.Queue()
+        self.max_idle = max_idle
 
         # set when starting run loop
         self._play = None
@@ -905,8 +911,12 @@ class Theatre:
             assert self._play
 
             loop_count = itertools.count()
+            idle_count = 0
             stop = False
             while not stop:
+                if self.max_idle and idle_count >= self.max_idle:
+                    print(f"Reached max idle count ({self.max_idle=}), stopping")
+                    break
                 cnt = next(loop_count)
                 print(f"Running main loop ({cnt})")
                 alive_count = sum(
@@ -920,7 +930,10 @@ class Theatre:
                 events = list(drain(self._events, timeout=self.clock_tick))
                 if not events:
                     print(f"({cnt}) No events in last cycle ({self.clock_tick}s)")
+                    idle_count += 1
                     continue
+
+                idle_count = 0
 
                 print(f"{len(events)} events to handle")
                 for event in events:
@@ -936,7 +949,14 @@ class Theatre:
 
                 self._process_conditions(self._play)
 
-            print(f"Terminating play: {stop=}")
+            print(f"Terminating play: {stop=} {idle_count=}")
+            for condition in self._play.conditions:
+                if idle_count >= self.max_idle:
+                    condition.future.set_exception(MaxIdleException(idle_count, self.max_idle))
+                elif stop:
+                    condition.future.set_exception(Event.Stop())
+                else:
+                    condition.future.set_exception(Exception("dunny why stop"))
         except BaseException as ex:
             print(f"Theatre run loop raised exception: {ex}")
             print_exc()
