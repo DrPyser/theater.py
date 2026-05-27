@@ -366,16 +366,15 @@ class Theatre:
             self._events.put(Event.LinkTrap(linker=owner, linked=target, future=fut))
 
         future.add_done_callback(link_callback)
-        self._events.put(
-            Event.RegisterCondition(
-                predicate=lambda play: (
-                    target in play.states
-                    and isinstance(play.states[target], State.Terminated)
-                ),
-                projection=get_termination_cause,
-                future=future,
-            )
+        condition = Event.RegisterCondition(
+            predicate=lambda play: (
+                target in play.states
+                and isinstance(play.states[target], State.Terminated)
+            ),
+            projection=get_termination_cause,
+            future=future,
         )
+        play.conditions.append(condition)
 
     def _handle_signal(self, actor: ActorAddr, signal: Signal, play: Play):
         # TODO: flag actor as cancelled, cancel any pending future
