@@ -874,6 +874,32 @@ class Theatre:
             case _:
                 print(f"Unknown event {event=}")
 
+    def _process_conditions(self, play):
+        triggered_conditions = []
+        for condition in play.conditions:
+            try:
+                if condition.predicate(play):
+                    print(f"Condition predicate satisified {condition=}")
+                    try:
+                        result = condition.projection(play)
+                    except Exception as ex:
+                        print(f"Condition projection raised {condition=}: {ex}")
+                        condition.future.set_exception(ex)
+                    else:
+                        print(
+                            f"Condition projection successful {condition=}: {result}"
+                        )
+                        condition.future.set_result(result)
+                    finally:
+                        triggered_conditions.append(condition)
+            except Exception as ex:
+                print(
+                    f"Exception from condition predicate {condition.predicate=}: {ex}"
+                )
+                continue
+        for condition in triggered_conditions:
+            play.conditions.remove(condition)
+
     def _run_loop(self):
         try:
             assert self._play
@@ -908,30 +934,7 @@ class Theatre:
                         break
                     print(f"Handled event {event}")
 
-                triggered_conditions = []
-                for condition in self._play.conditions:
-                    try:
-                        if condition.predicate(self._play):
-                            print(f"Condition predicate satisified {condition=}")
-                            try:
-                                result = condition.projection(self._play)
-                            except Exception as ex:
-                                print(f"Condition projection raised {condition=}: {ex}")
-                                condition.future.set_exception(ex)
-                            else:
-                                print(
-                                    f"Condition projection successful {condition=}: {result}"
-                                )
-                                condition.future.set_result(result)
-                            finally:
-                                triggered_conditions.append(condition)
-                    except Exception as ex:
-                        print(
-                            f"Exception from condition predicate {condition.predicate=}: {ex}"
-                        )
-                        continue
-                for condition in triggered_conditions:
-                    self._play.conditions.remove(condition)
+                self._process_conditions(self._play)
 
             print(f"Terminating play: {stop=}")
         except BaseException as ex:
