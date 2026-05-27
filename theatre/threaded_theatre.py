@@ -104,6 +104,7 @@ class State:
         """Actor waiting for a message in mailbox"""
 
         request: object
+        timeout_task: CancellableTask
 
 
 ActorState = (
@@ -174,6 +175,12 @@ class Event:
         linked: ActorAddr
         future: Future
 
+    @dataclass
+    class ReceiveTimeout:
+        actor: ActorAddr
+        request: object
+        timeout_task: CancellableTask
+
 
 @dataclass
 class NormalExit:
@@ -205,6 +212,11 @@ class ActorTerminated(Exception):
     def __init__(self, actor: ActorAddr, cause: Exit | Signal):
         self.actor = actor
         self.cause = cause
+
+
+class ReceiveTimeout(Exception):
+    def __init__(self, request: object):
+        self.request = request
 
 
 class ActorSignaled(Exception):
@@ -377,8 +389,6 @@ class Theatre:
         play.conditions.append(condition)
 
     def _handle_signal(self, actor: ActorAddr, signal: Signal, play: Play):
-        # TODO: flag actor as cancelled, cancel any pending future
-        # dispatch actor's coroutine on a throw to handle the cancellation
         sheet = play.actors[actor]
         state = play.states[actor]
         match signal:
@@ -387,6 +397,13 @@ class Theatre:
                     case State.Terminated():
                         # nothing to do
                         print(f"SIGKILL sent to terminated actor {actor}")
+                    case State.Receiving(timeout_task=tfut):
+                        print(
+                            f"actor({actor}) received SIGKILL while receiving; cancelling timeout"
+                        )
+                        if tfut:
+                            tfut.cancel()
+                        play.states[actor] = State.Terminated(cause=signal)
                     case (
                         State.Init(future)
                         | State.Awaiting(response_future=future)
@@ -407,6 +424,16 @@ class Theatre:
                     case State.Terminated():
                         print(f"SIGINT sent to terminated actor {actor}")
                         pass
+                    case State.Receiving(request=request, timeout_task=tfut):
+                        print(
+                            f"actor({actor}) received SIGINT while receiving; cancelling timeout and scheduling signal handling"
+                        )
+                        if tfut:
+                            tfut.cancel()
+                        exec_future = self._submit_performance(
+                            actor, sheet.play.throw, ActorCancelled(actor)
+                        )
+                        play.states[actor] = State.Executing(exec_future)
                     case (
                         State.Init(future)
                         | State.Awaiting(response_future=future)
@@ -478,12 +505,46 @@ class Theatre:
                 play.states[addr] = State.Awaiting(
                     request=request, response_future=resp_future
                 )
-            case receive(filter=filter_fn):
+            case receive(filter=filter_fn, timeout=timeout):
                 try:
                     msg = sheet.mailbox.pop_matching(filter_fn)
                 except _NoMatch:
                     print(f"Parking actor({addr}) on receive request ({request})")
-                    play.states[addr] = State.Receiving(request=request)
+                    timeout_task = None
+                    if timeout is not None:
+                        print(
+                            f"actor({addr}): Scheduling timeout for receive request in {timeout}s"
+                        )
+                        # setup timeout task
+                        interrupt = threading.Event()
+
+                        def delayed():
+                            if interrupt.wait(timeout=timeout):
+                                if not interrupt.is_set():
+                                    raise ReceiveTimeout(request)
+
+                        fut = self.executor.submit(delayed)
+                        timeout_task = CancellableTask(future=fut, interrupt=interrupt)
+
+                        # on completion, timeout event is queued
+                        # event handler should check that actor is still in Receiving state
+                        # and handling MessageReceived should cancel corresponding timeout task
+                        def timeout_callback(f):
+                            # if not f.cancelled() and isinstance(f.exception(), ReceiveTimeout):
+                            print(f"Receive timeout triggered ({f.cancelled()=},{f.exception()=})")
+                            if not (interrupt.is_set() or f.cancelled()):
+                                self._events.put(
+                                    Event.ReceiveTimeout(
+                                        actor=addr,
+                                        request=request,
+                                        timeout_task=timeout_task,
+                                    )
+                                )
+
+                        fut.add_done_callback(timeout_callback)
+                    play.states[addr] = State.Receiving(
+                        request=request, timeout_task=timeout_task
+                    )
                 else:
                     print(f"actor({addr}) request {request} satisfied directly: {msg}")
                     resp_future = Future()
@@ -591,8 +652,20 @@ class Theatre:
                 print(f"actor({addr}) still executing (future {fut})")
                 return False
 
-            case State.Receiving(request=request):
+            case State.Receiving(request=request, timeout_task=tfut):
                 print(f"actor ({addr}) still in Receiving state for request {request=}")
+                assert not tfut or not tfut.cancelled(), (
+                    "Receiving state should not be observed with cancelled timeout"
+                )
+                if tfut and tfut.done():
+                    # TODO: can throw to actor now
+                    # leaving it to callback event handler to propagate to actor
+                    # and transition state
+                    print(
+                        f"actor({addr}): Receiving state observed with completed timeout task"
+                    )
+                    pass
+
                 return False
 
             case State.Terminated(cause=cause):
@@ -676,8 +749,15 @@ class Theatre:
                     return
                 actor_state = play.states[actor]
                 match actor_state:
-                    case State.Receiving(request=request):
+                    case State.Receiving(request=request, timeout_task=tfut):
                         sheet = play.actors[actor]
+                        if tfut and tfut.done():
+                            # timeout expired but event not processed yet
+                            # skip and let event be processed
+                            print(
+                                f"actor({actor}): message received but timeout already triggered"
+                            )
+                            return
                         filter_fn = (
                             request.filter if isinstance(request, receive) else None
                         )
@@ -690,6 +770,8 @@ class Theatre:
                             pass
                         else:
                             print(f"actor({actor}) request({request}) satisfied: {msg}")
+                            if tfut:
+                                tfut.cancel()
                             resp_future = Future()
                             resp_future.set_result(msg)
                             play.states[actor] = State.Awaiting(
@@ -764,6 +846,31 @@ class Theatre:
                         )
                         play.states[linker] = State.Executing(exec_future)
                 self._chain_transitions(linker, play)
+            case Event.ReceiveTimeout(
+                actor=actor, request=request, timeout_task=future
+            ):
+                assert future.done()
+                if actor not in play.states:
+                    print(f"Unknown actor {actor}, ignoring")
+                    return
+                state = play.states[actor]
+                sheet = play.actors[actor]
+                match state:
+                    case State.Receiving(request=req, timeout_task=tfut):
+                        assert future is tfut
+                        assert req == request
+                        print(f"actor({actor}): receive request {req} timed out")
+                        exec_future = self._submit_performance(
+                            actor,
+                            sheet.play.throw,
+                            ReceiveTimeout(request=req),
+                        )
+                        play.states[actor] = State.Executing(exec_future)
+                    case _:
+                        print(
+                            f"actor({actor}): ignoring stale receive timeout while actor in state {state}"
+                        )
+                self._chain_transitions(actor, play)
             case _:
                 print(f"Unknown event {event=}")
 

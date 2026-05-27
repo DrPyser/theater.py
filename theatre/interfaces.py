@@ -51,6 +51,7 @@ class send(Generic[T]):
 @dataclass
 class receive(Generic[T]):
     filter: Callable[[T], bool] | None = None
+    timeout: float | None = None
 
 
 @dataclass

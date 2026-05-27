@@ -1,3 +1,4 @@
+import time
 import pytest
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -11,6 +12,7 @@ from theatre.threaded_theatre import (
     RequestCancelled,
     ActorCancelled,
     UnsupportedRequest,
+    ReceiveTimeout,
     drain,
     ErrorExit,
     NormalExit,
@@ -469,3 +471,95 @@ def test_fire_in_theatre_while_sleep():
             theatre.spawn(actor)
             raise Exception()
     assert threading.active_count() == 1
+
+
+def test_receive_with_timeout():
+    def actor(*args):
+        while True:
+            try:
+                t = time.time()
+                msg = yield receive(timeout=0.05)
+            except ReceiveTimeout as ex:
+                t2 = time.time()
+                print(f"{t2} - {t} = {t2 - t}")
+                return ex
+
+    with curtain_call() as theatre:
+        result = theatre.run(actor)
+        assert isinstance(result, ReceiveTimeout)
+    assert threading.active_count() == 1
+
+
+def test_receive_timeout_interrupted_by_sigint():
+    def actor(*args):
+        try:
+            msg = yield receive(timeout=5)
+        except ActorCancelled:
+            yield Theatre.exit("cancelled")
+
+    with curtain_call() as theatre:
+        addr = theatre.spawn(actor)
+        time.sleep(0.05)
+        theatre.cancel(addr)
+        result = theatre.spotlight(addr)
+        assert result == "cancelled"
+
+
+def test_receive_timeout_cancelled_on_message():
+    def receiver(*args):
+        msg = yield receive(timeout=5)
+        yield Theatre.exit(msg)
+
+    def sender(target, *args):
+        yield send(target, "hello")
+
+    with curtain_call() as theatre:
+        recv = theatre.spawn(receiver)
+        theatre.spawn(sender, recv)
+        result = theatre.spotlight(recv)
+        assert result == "hello"
+
+
+def test_receive_timeout_with_filter_matches_before_timeout():
+    def receiver(*args):
+        msg = yield receive(filter=lambda m: m == "hello", timeout=5)
+        yield Theatre.exit(msg)
+
+    def sender(target, *args):
+        yield send(target, "hello")
+
+    with curtain_call() as theatre:
+        recv = theatre.spawn(receiver)
+        theatre.spawn(sender, recv)
+        result = theatre.spotlight(recv)
+        assert result == "hello"
+
+
+def test_receive_timeout_with_filter_no_match_expires():
+    def actor(*args):
+        try:
+            msg = yield receive(filter=lambda m: False, timeout=0.05)
+        except ReceiveTimeout as ex:
+            return ex
+
+    with curtain_call() as theatre:
+        result = theatre.run(actor)
+        assert isinstance(result, ReceiveTimeout)
+    assert threading.active_count() == 1
+
+
+def test_stale_receive_timeout_ignored():
+    def receiver(*args):
+        msg = yield receive(timeout=0.3)
+        yield Theatre.sleep(0.005)
+        yield Theatre.exit(msg)
+
+    def sender(target, *args):
+        yield send(target, "hello")
+
+    with curtain_call() as theatre:
+        recv = theatre.spawn(receiver)
+        theatre.spawn(sender, recv)
+        result = theatre.spotlight(recv)
+        assert result == "hello"
+
