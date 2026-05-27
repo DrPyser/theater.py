@@ -374,66 +374,40 @@ class Theatre:
         )
         play.conditions.append(condition)
 
+    def _cancel_pending_task(self, actor, play):
+        state = play.states[actor]
+        print(f"actor({actor}): cancelling pending tasks for state {state}")
+        match state:
+            case State.Receiving(timeout_task=tfut):
+                if tfut:
+                    tfut.cancel()
+            case (
+                State.Init(future)
+                | State.Awaiting(response_future=future)
+                | State.Executing(future)
+            ):
+                future.cancel()
+            case _:  # no pending future or state to cleanup
+                pass
+
     def _handle_signal(self, actor: ActorAddr, signal: Signal, play: Play):
         sheet = play.actors[actor]
         state = play.states[actor]
+        print(f"{signal} sent to actor {actor} in state {state}")
         match signal:
             case Signal.KILL:
                 match state:
                     case State.Terminated():
-                        # nothing to do
-                        print(f"SIGKILL sent to terminated actor {actor}")
-                    case State.Receiving(timeout_task=tfut):
-                        print(
-                            f"actor({actor}) received SIGKILL while receiving; cancelling timeout"
-                        )
-                        if tfut:
-                            tfut.cancel()
-                        play.states[actor] = State.Terminated(cause=signal)
-                    case (
-                        State.Init(future)
-                        | State.Awaiting(response_future=future)
-                        | State.Executing(future)
-                    ):
-                        print(
-                            f"actor({actor}) received SIGKILL during execution of future {future}; cancelling and terminating"
-                        )
-                        future.cancel()
-                        play.states[actor] = State.Terminated(cause=signal)
-                    case _:  # no pending future or state to cleanup
-                        print(
-                            f"actor({actor}) received SIGKILL while in state {state}; terminating"
-                        )
+                        pass
+                    case _:
+                        self._cancel_pending_task(actor, play)
                         play.states[actor] = State.Terminated(cause=signal)
             case Signal.INT:
                 match play.states[actor]:
                     case State.Terminated():
-                        print(f"SIGINT sent to terminated actor {actor}")
                         pass
-                    case State.Receiving(request=request, timeout_task=tfut):
-                        print(
-                            f"actor({actor}) received SIGINT while receiving; cancelling timeout and scheduling signal handling"
-                        )
-                        if tfut:
-                            tfut.cancel()
-                        exec_future = self._submit_performance(
-                            actor, sheet.performance.throw, ActorCancelled(actor)
-                        )
-                        play.states[actor] = State.Executing(exec_future)
-                    case (
-                        State.Init(future)
-                        | State.Awaiting(response_future=future)
-                        | State.Executing(future)
-                    ):
-                        future.cancel()
-                        exec_future = self._submit_performance(
-                            actor, sheet.performance.throw, ActorCancelled(actor)
-                        )
-                        play.states[actor] = State.Executing(exec_future)
-                    case state:
-                        print(
-                            f"actor({actor}) received SIGINT while in state {state}; scheduling signal handling opportunity"
-                        )
+                    case _:
+                        self._cancel_pending_task(actor, play)
                         exec_future = self._submit_performance(
                             actor, sheet.performance.throw, ActorCancelled(actor)
                         )
