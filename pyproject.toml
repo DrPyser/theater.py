@@ -33,9 +33,6 @@ packages = ["theatre"]
 
 [tool.pytest.ini_options]
 testpaths = ["theatre"]
-python_files = ["tests.py"]
-python_classes = ["Test*"]
-python_functions = ["test_*"]
 
 [tool.ruff]
 src = ["theatre"]
