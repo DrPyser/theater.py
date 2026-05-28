@@ -622,3 +622,20 @@ def test_stale_receive_timeout_ignored():
         result = theatre.spotlight(recv)
         assert result == "hello"
 
+def test_theatre_send():
+    def catcher(i):
+        msg = yield System.receive()
+        assert msg == i
+        return i
+
+    with curtain_call(max_idle=1) as theatre:
+        pool = []
+        for i in range(10):
+            pool.append((i, theatre.spawn(catcher, i)))
+
+        for n, actor in pool:
+            theatre.send(actor, n)
+
+        theatre.wait_ensemble()
+
+

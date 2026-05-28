@@ -152,6 +152,11 @@ class Event:
         pass
 
     @dataclass
+    class ExternalRequest:
+        request: Any
+        result_future: Future
+
+    @dataclass
     class SpawnRequested:
         script: Actor
         props: tuple[Any, ...]
@@ -390,6 +395,24 @@ class Theatre:
             case _:  # no pending future or state to cleanup
                 pass
 
+    def _send(self, address: ActorAddr, message, future: Future, play: Play):
+        if destination := play.actors.get(address):
+            match play.states[address]:
+                case State.Terminated(cause=cause):
+                    future.set_exception(ActorTerminated(address, cause))
+                case _:
+                    try:
+                        destination.mailbox.append(message)
+                    except MailboxFull as ex:
+                        future.set_exception(ex)
+                    else:
+                        self._events.put(
+                            Event.MessageDelivered(actor=address)
+                        )
+                        future.set_result(None)
+        else:
+            future.set_exception(DestinationNotFound(address))
+
     def _handle_signal(self, actor: ActorAddr, signal: Signal, play: Play):
         sheet = play.actors[actor]
         state = play.states[actor]
@@ -446,22 +469,7 @@ class Theatre:
                 )
             case System.send(dest_addr, msg):
                 resp_future = Future()
-                if destination := play.actors.get(dest_addr):
-                    match play.states[dest_addr]:
-                        case State.Terminated(cause=cause):
-                            resp_future.set_exception(ActorTerminated(dest_addr, cause))
-                        case _:
-                            try:
-                                destination.mailbox.append(msg)
-                            except MailboxFull as ex:
-                                resp_future.set_exception(ex)
-                            else:
-                                self._events.put(
-                                    Event.MessageDelivered(actor=dest_addr)
-                                )
-                                resp_future.set_result(None)
-                else:
-                    resp_future.set_exception(DestinationNotFound(dest_addr))
+                self._send(dest_addr, msg, resp_future, play)
                 play.states[addr] = State.Awaiting(
                     request=request, response_future=resp_future
                 )
@@ -544,6 +552,18 @@ class Theatre:
                     addr, sheet.performance.throw, UnsupportedRequest(addr, request)
                 )
                 play.states[addr] = State.Executing(future=future)
+
+    def _handle_external_request(self, request, result_future: Future, play: Play):
+        match request:
+            case System.spawn(script, props):
+                address = self._spawn(script=script, props=props)
+                result_future.set_result(address)
+                self._chain_transitions(address, play)
+            case System.send(address, message):
+                self._send(address, message, result_future, play)
+            case _:
+                result_future.set_exception(NotImplementedError(request))
+
 
     def _process_state(self, addr: ActorAddr, play: Play) -> bool:
         if addr not in play.states:
@@ -745,10 +765,8 @@ class Theatre:
                         pass
             case Event.RegisterCondition(predicate=pred, projection=proj, future=fut):
                 self._play.conditions.append(event)
-            case Event.SpawnRequested(script, props, result_future):
-                address = self._spawn(script=script, props=props)
-                result_future.set_result(address)
-                self._chain_transitions(address, play)
+            case Event.ExternalRequest(request, result_future):
+                self._handle_external_request(request, result_future, play)
             case Event.Signal(actor, signal):
                 if not isinstance(play.states[actor], State.Terminated):
                     self._handle_signal(actor, signal, play)
@@ -943,19 +961,31 @@ class Theatre:
         )
         return sheet.address
 
+    def _request(self, request):
+        future = Future()
+        self._events.put(
+            Event.ExternalRequest(
+                request=request,
+                result_future=future
+            )
+        )
+        return future
+
     def spawn(self, script, *props):
         assert self._thread.is_alive()
-        result_future = Future()
-        event = Event.SpawnRequested(
-            script=script,
-            props=props,
-            result_future=result_future,
+        future = self._request(
+            System.spawn(
+                script=script,
+                props=props,
+            )
         )
-        self._events.put(event)
-        print(f"Awaiting spawn request response {result_future=}")
-        new_address = result_future.result()
+        new_address = future.result()
         return new_address
 
+    def send(self, address: ActorAddr, message):
+        future = self._request(System.send(address, message))
+        return future.result()
+        
     def run(self, protagonist: Actor, *props):
         if not (self._thread and self._thread.is_alive()):
             raise RuntimeError("No running run loop thread!")
