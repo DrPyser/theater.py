@@ -74,38 +74,38 @@ class ActorAddress(Address, tuple):
 
 
 class State:
-    @dataclass
+    @dataclass(frozen=True)
     class Init:
         """Actor initializing - executing code before first yield"""
 
         future: CancellableTask
 
-    @dataclass
+    @dataclass(frozen=True)
     class Waiting:
         """Actor yielded a request, not yet dispatched"""
 
         request: object
 
-    @dataclass
+    @dataclass(frozen=True)
     class Awaiting:
         """Request dispatched, waiting for response_future to complete"""
 
         request: object
         response_future: CancellableTask
 
-    @dataclass
+    @dataclass(frozen=True)
     class Executing:
         """Request fulfilled, actor executing until next yield"""
 
         future: CancellableTask
 
-    @dataclass
+    @dataclass(frozen=True)
     class Terminated:
         """Actor finished execution"""
 
         cause: Exit | Signal
 
-    @dataclass
+    @dataclass(frozen=True)
     class Receiving:
         """Actor waiting for a message in mailbox"""
 
