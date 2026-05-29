@@ -23,11 +23,10 @@ MessageT = TypeVar("MessageT")
 
 
 class Mailbox(Iterable, Protocol):
-    def append(self, msg: Any) -> None:
-        ...
+    def append(self, msg: Any) -> None: ...
 
-    def pop_matching(self, filter_fn: Callable[[Any], bool] | None = None) -> Any:
-        ...
+    def pop_matching(self, filter_fn: Callable[[Any], bool] | None = None) -> Any: ...
+
 
 PropsT = TypeVar("PropsT")
 Script = Callable[[PropsT], Coroutine]
@@ -54,40 +53,33 @@ class System:
     class sleep:
         duration: float
 
-
     @dataclass
     class send(Generic[T]):
         address: Address
         message: T
-
 
     @dataclass
     class receive(Generic[T]):
         filter: Callable[[T], bool] | None = None
         timeout: float | None = None
 
-
     @dataclass
     class select(Generic[T]):
         predicates: list[Callable[[T], bool]]
-
 
     @dataclass
     class spawn(Generic[PropsT]):
         script: Script
         props: PropsT = ()
 
-
     @dataclass
     class link:
         target: Address
-
 
     @dataclass
     class spawn_link(Generic[PropsT]):
         script: Script
         props: PropsT = ()
-
 
     @dataclass
     class kill:
