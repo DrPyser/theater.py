@@ -1,3 +1,4 @@
+import os
 import threading
 import queue
 import enum
@@ -16,26 +17,15 @@ from collections.abc import Iterator
 from contextvars import copy_context
 from typing import NewType, Any, Callable
 from dataclasses import dataclass, field
-    Actor, Exit, ActorSheet, System
-)
+from theatre.interfaces import Actor, Exit, ActorSheet, System, Address
 
 logger = logging.getLogger(__name__)
-
-
-def create_actor_sheet(actor_script, props, addr, mailbox):
-    return ActorSheet(
-        address=addr,
-        script=actor_script,
-        performance=actor_script(*props),
-        props=props,
-        mailbox=mailbox(),
-        context=copy_context(),
-    )
 
 
 class RequestCancelled(Exception):
     def __init__(self, req):
         self.req = req
+
 
 class MaxIdleException(Exception):
     def __init__(self, idle_count, max_idle):
@@ -72,7 +62,15 @@ class CancellableTask:
         return self._future
 
 
-ActorAddr = NewType("ActorAddr", int)
+class ActorAddress(Address, tuple):
+    def __new__(cls, pid, theatre_id, coroutine_id):
+        return tuple.__new__(cls, (pid, theatre_id, coroutine_id))
+
+    def __str__(self):
+        return "#[{}]".format("-".join(map(str, self)))
+
+    def __repr__(self):
+        return "ActorAddress({})".format(", ".join(map(str, self)))
 
 
 class State:
@@ -137,7 +135,7 @@ class Signal(enum.Enum):
 class Event:
     @dataclass
     class ActorEvent:
-        actor: ActorAddr
+        actor: ActorAddress
 
     @dataclass
     class RequestCompleted(ActorEvent):
@@ -169,7 +167,7 @@ class Event:
 
     @dataclass
     class Signal:
-        actor: ActorAddr
+        actor: ActorAddress
         signal: Signal
 
     @dataclass
@@ -178,13 +176,13 @@ class Event:
 
     @dataclass
     class LinkTrap:
-        linker: ActorAddr
-        linked: ActorAddr
+        linker: ActorAddress
+        linked: ActorAddress
         future: Future
 
     @dataclass
     class ReceiveTimeout:
-        actor: ActorAddr
+        actor: ActorAddress
         request: object
         timeout_task: CancellableTask
 
@@ -206,17 +204,17 @@ Exit = NormalExit | ErrorExit
 
 
 class DestinationNotFound(Exception):
-    def __init__(self, destination: ActorAddr):
+    def __init__(self, destination: ActorAddress):
         self.destination = destination
 
 
 class ActorCancelled(Exception):
-    def __init__(self, actor: ActorAddr):
+    def __init__(self, actor: ActorAddress):
         self.actor = actor
 
 
 class ActorTerminated(Exception):
-    def __init__(self, actor: ActorAddr, cause: Exit | Signal):
+    def __init__(self, actor: ActorAddress, cause: Exit | Signal):
         self.actor = actor
         self.cause = cause
 
@@ -227,7 +225,7 @@ class ReceiveTimeout(Exception):
 
 
 class ActorSignaled(Exception):
-    def __init__(self, actor: ActorAddr, signal: Signal):
+    def __init__(self, actor: ActorAddress, signal: Signal):
         self.actor = actor
         self.signal = signal
 
@@ -272,7 +270,7 @@ class Mailbox:
 
 
 class UnsupportedRequest(Exception):
-    def __init__(self, actor: ActorAddr, req: Any):
+    def __init__(self, actor: ActorAddress, req: Any):
         self.actor = actor
         self.request = req
 
@@ -300,8 +298,8 @@ def drain(queue_: queue.Queue[Event], timeout=None) -> Iterator[Event]:
 
 @dataclass
 class Play:
-    states: dict[ActorAddr, ActorState]
-    actors: dict[ActorAddr, ActorSheet]
+    states: dict[ActorAddress, ActorState]
+    actors: dict[ActorAddress, ActorSheet]
     conditions: list[Event.RegisterCondition] = field(default_factory=list)
 
 
@@ -321,9 +319,9 @@ class Theatre:
         self._play = None
         self._thread = None
 
-    def make_addr(self, script, props) -> ActorAddr:
-        addr = hash((script, props, next(self._counter)))
-        return ActorAddr(addr)
+    def make_addr(self, performance) -> ActorAddress:
+        addr = ActorAddress(os.getpid(), id(self), id(performance))
+        return addr
 
     def _submit_performance(self, addr, fn, *args, interrupt=None):
         self._logger.debug(
@@ -349,12 +347,19 @@ class Theatre:
         return task
 
     def _create_actor(self, script, props):
-        addr = self.make_addr(script, props)
-        mailbox = lambda: Mailbox(maxlen=self.queue_size)
-        sheet = create_actor_sheet(script, props, addr, mailbox)
-        return sheet
+        mailbox = Mailbox(maxlen=self.queue_size)
+        actor_coro = script(*props)
+        addr = self.make_addr(actor_coro)
+        return ActorSheet(
+            address=addr,
+            script=script,
+            props=props,
+            performance=actor_coro,
+            mailbox=mailbox,
+            context=copy_context(),
+        )
 
-    def _link(self, owner: ActorAddr, target: ActorAddr, play: Play):
+    def _link(self, owner: ActorAddress, target: ActorAddress, play: Play):
         # register link callback
         self._logger.debug(
             f"registering link condition: owner({owner}) <- target({target})"
@@ -399,7 +404,7 @@ class Theatre:
             case _:  # no pending future or state to cleanup
                 pass
 
-    def _send(self, address: ActorAddr, message, future: Future, play: Play):
+    def _send(self, address: ActorAddress, message, future: Future, play: Play):
         if destination := play.actors.get(address):
             match play.states[address]:
                 case State.Terminated(cause=cause):
@@ -415,7 +420,7 @@ class Theatre:
         else:
             future.set_exception(DestinationNotFound(address))
 
-    def _handle_signal(self, actor: ActorAddr, signal: Signal, play: Play):
+    def _handle_signal(self, actor: ActorAddress, signal: Signal, play: Play):
         sheet = play.actors[actor]
         state = play.states[actor]
         self._logger.debug(f"{signal} sent to actor {actor} in state {state}")
@@ -574,7 +579,7 @@ class Theatre:
             case _:
                 result_future.set_exception(NotImplementedError(request))
 
-    def _process_state(self, addr: ActorAddr, play: Play) -> bool:
+    def _process_state(self, addr: ActorAddress, play: Play) -> bool:
         if addr not in play.states:
             return False
         state = play.states[addr]
@@ -684,7 +689,7 @@ class Theatre:
                 # TODO: handle terminated actors (links, cleanup)
                 return False
 
-    def _chain_transitions(self, actor: ActorAddr, play: Play) -> None:
+    def _chain_transitions(self, actor: ActorAddress, play: Play) -> None:
         self._logger.debug(f"Chaining transitions for actor {actor}")
         state = play.states[actor]
         while self._process_state(actor, play):
@@ -1015,7 +1020,7 @@ class Theatre:
         new_address = future.result()
         return new_address
 
-    def send(self, address: ActorAddr, message):
+    def send(self, address: ActorAddress, message):
         future = self._request(System.send(address, message))
         return future.result()
 
@@ -1044,7 +1049,7 @@ class Theatre:
         )
         return future.result()
 
-    def spotlight(self, actor: ActorAddr):
+    def spotlight(self, actor: ActorAddress):
         # wait for a specific actor to terminate
         future = Future()
         self._events.put(
@@ -1065,13 +1070,13 @@ class Theatre:
             case Signal() as signal:
                 raise ActorSignaled(actor, signal)
 
-    def cancel(self, actor: ActorAddr):
+    def cancel(self, actor: ActorAddress):
         self._events.put(Event.Signal(actor, Signal.INT))
 
-    def kill(self, actor: ActorAddr):
+    def kill(self, actor: ActorAddress):
         self._events.put(Event.Signal(actor, Signal.KILL))
 
-    def signal(self, actor: ActorAddr, signal: Signal):
+    def signal(self, actor: ActorAddress, signal: Signal):
         self._events.put(Event.Signal(actor, signal))
 
     def signal_all(self, signal: Signal):
