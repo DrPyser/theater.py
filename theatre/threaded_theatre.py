@@ -157,12 +157,6 @@ class Event:
         request: Any
         result_future: Future
 
-    @dataclass
-    class SpawnRequested:
-        script: Actor
-        props: tuple[Any, ...]
-        result_future: Future
-
     class Stop(Exception):
         def __init__(self):
             super().__init__("Stopping play")
