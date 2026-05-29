@@ -2,9 +2,7 @@ import time
 import pytest
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
-from theatre.interfaces import (
-    System
-)
+from theatre.interfaces import System
 from theatre.threaded_theatre import (
     Theatre,
     DestinationNotFound,
@@ -622,6 +620,7 @@ def test_stale_receive_timeout_ignored():
         result = theatre.spotlight(recv)
         assert result == "hello"
 
+
 def test_theatre_send():
     def catcher(i):
         msg = yield System.receive()
@@ -637,5 +636,3 @@ def test_theatre_send():
             theatre.send(actor, n)
 
         theatre.wait_ensemble()
-
-
