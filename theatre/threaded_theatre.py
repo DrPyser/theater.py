@@ -319,6 +319,9 @@ class Theatre:
         self._play = None
         self._thread = None
 
+    def __str__(self):
+        return f"Theatre({self.queue_size=},{self.max_idle=},{self.clock_tick=})"
+
     def make_addr(self, performance) -> ActorAddress:
         addr = ActorAddress(os.getpid(), id(self), id(performance))
         return addr
