@@ -304,6 +304,29 @@ class Play:
     conditions: list[Event.RegisterCondition] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class ActorInfo:
+    address: ActorAddress
+    script: str
+    props: Any
+    state_name: str
+    mailbox_size: int = 0
+    exit_cause: Exit | Signal | None = None
+
+    @classmethod
+    def from_run_state(
+        cls, sheet: ActorSheet, state: ActorState
+    ) -> ActorInfo:
+        return cls(
+            address=sheet.address,
+            script=getattr(sheet.script, "__qualname__", str(sheet.script)),
+            props=sheet.props,
+            state_name=type(state).__name__,
+            mailbox_size=len(sheet.mailbox),
+            exit_cause=state.cause if isinstance(state, State.Terminated) else None,
+        )
+
+
 class Theatre:
     def __init__(
         self, executor: Executor, queue_size=1024, clock_tick=1, max_idle=None
@@ -1073,6 +1096,20 @@ class Theatre:
                 raise error
             case Signal() as signal:
                 raise ActorSignaled(actor, signal)
+
+    def census(self):
+        future = Future()
+        self._events.put(
+            Event.RegisterCondition(
+                predicate=lambda play: True,
+                projection=lambda play: [
+                    ActorInfo.from_run_state(play.actors[addr], play.states[addr])
+                    for addr in play.actors
+                ],
+                future=future,
+            )
+        )
+        return future.result()
 
     def cancel(self, actor: ActorAddress):
         self._events.put(Event.Signal(actor, Signal.INT))

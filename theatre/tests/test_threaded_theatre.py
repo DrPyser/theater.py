@@ -1,3 +1,4 @@
+import dataclasses
 import time
 import pytest
 import threading
@@ -5,6 +6,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from theatre.interfaces import System
 from theatre.threaded_theatre import (
     Theatre,
+    ActorInfo,
     DestinationNotFound,
     curtain_call,
     RequestCancelled,
@@ -636,3 +638,64 @@ def test_theatre_send():
             theatre.send(actor, n)
 
         theatre.wait_ensemble()
+
+
+def test_census_returns_actor_infos():
+    def simple(*args):
+        yield System.exit(42)
+
+    with curtain_call() as theatre:
+        addr = theatre.spawn(simple)
+        time.sleep(0.05)
+        infos = theatre.census()
+        assert len(infos) == 1
+        info = infos[0]
+        assert info.address == addr
+        assert info.script.endswith("simple")
+        assert isinstance(info.state_name, str)
+
+
+def test_census_multiple_actors():
+    def worker(name, *args):
+        yield System.receive()
+        yield System.exit(name)
+
+    with curtain_call() as theatre:
+        a1 = theatre.spawn(worker, "a")
+        a2 = theatre.spawn(worker, "b")
+        theatre.send(a1, "go")
+        theatre.send(a2, "go")
+        theatre.wait_ensemble()
+        infos = theatre.census()
+        assert len(infos) == 2
+        for info in infos:
+            assert info.state_name == "Terminated"
+            assert info.props == (info.exit_cause.value,)
+
+
+def test_census_frozen():
+    def simple(*args):
+        yield System.exit(42)
+
+    with curtain_call() as theatre:
+        theatre.spawn(simple)
+        time.sleep(0.05)
+        infos = theatre.census()
+        info = infos[0]
+        with pytest.raises((AttributeError, dataclasses.FrozenInstanceError)):
+            info.state_name = "mutated"
+
+
+def test_census_live_actor_has_correct_state():
+    def waiter(*args):
+        msg = yield System.receive()
+        yield System.exit(msg)
+
+    with curtain_call() as theatre:
+        addr = theatre.spawn(waiter)
+        time.sleep(0.05)
+        infos = theatre.census()
+        info = next(i for i in infos if i.address == addr)
+        assert info.state_name == "Receiving"
+        assert info.mailbox_size == 0
+        assert info.exit_cause is None
