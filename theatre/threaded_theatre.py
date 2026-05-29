@@ -1,23 +1,24 @@
-import os
-import threading
-import queue
+from __future__ import annotations
+
 import enum
-import time
 import itertools
 import logging
+import os
+import queue
+import threading
+from collections import deque
+from collections.abc import Callable, Iterator
 from concurrent.futures import (
-    ThreadPoolExecutor,
-    Future,
-    as_completed,
     CancelledError,
     Executor,
+    Future,
+    ThreadPoolExecutor,
 )
-from collections import deque
-from collections.abc import Iterator
 from contextvars import copy_context
-from typing import NewType, Any, Callable
 from dataclasses import dataclass, field
-from theatre.interfaces import Actor, Exit, ActorSheet, System, Address
+from typing import Any
+
+from theatre.interfaces import Actor, ActorSheet, Address, System
 
 logger = logging.getLogger(__name__)
 
@@ -800,7 +801,7 @@ class Theatre:
                     case _:
                         self._logger.debug(f"actor({actor}) not in Receiving state")
                         pass
-            case Event.RegisterCondition(predicate=pred, projection=proj, future=fut):
+            case Event.RegisterCondition():
                 self._play.conditions.append(event)
             case Event.ExternalRequest(request, result_future):
                 self._handle_external_request(request, result_future, play)
