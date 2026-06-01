@@ -351,6 +351,64 @@ class StateMachine:
             case _:
                 pass
 
+    def terminate(self, addr, cause, play):
+        self.cancel_pending_task(addr, play)
+        play.states[addr] = State.Terminated(cause=cause)
+
+    def resolve(self, addr, request, value, play):
+        resp_future = Future()
+        resp_future.set_result(value)
+        play.states[addr] = State.Awaiting(request=request, response_future=resp_future)
+
+    def await_future(self, addr, request, future, play):
+        play.states[addr] = State.Awaiting(request=request, response_future=future)
+
+    def park(self, addr, request, timeout_task, play):
+        play.states[addr] = State.Receiving(request=request, timeout_task=timeout_task)
+
+    def initiate(self, addr, play, stage):
+        sheet = play.actors[addr]
+        future = stage.submit_performance(addr, sheet.performance.send, None)
+        play.states[addr] = State.Init(future=future)
+
+    def resume_with_value(self, addr, value, play, stage):
+        sheet = play.actors[addr]
+        future = stage.submit_performance(addr, sheet.performance.send, value)
+        play.states[addr] = State.Executing(future=future)
+
+    def resume_with_error(self, addr, exc, play, stage):
+        sheet = play.actors[addr]
+        future = stage.submit_performance(addr, sheet.performance.throw, exc)
+        play.states[addr] = State.Executing(future=future)
+
+    def interrupt(self, addr, exc, play, stage):
+        state = play.states[addr]
+        sheet = play.actors[addr]
+        match state:
+            case State.Init(future=fut) | State.Executing(future=fut):
+                if fut.cancel():
+                    exec_future = stage.submit_performance(
+                        addr, sheet.performance.throw, exc
+                    )
+                    play.states[addr] = State.Executing(future=exec_future)
+                else:
+                    # the future was *not* cancelled, so we need to chain on its completion
+                    # to signal the interruption on the next opportunity
+                    def exec_chain():
+                        result = fut.result()
+                        stage.logger.debug("actor({addr}): dismissing request %s to signal interruption")
+                        sheet.performance.throw(exc)
+
+                    exec_future = stage.submit_performance(addr, exec_chain)
+                    play.states[addr] = State.Executing(future=exec_future)
+            case _:
+                self.cancel_pending_task(addr, play)
+                if not isinstance(state, State.Terminated):
+                    exec_future = stage.submit_performance(
+                        addr, sheet.performance.throw, exc
+                    )
+                    play.states[addr] = State.Executing(future=exec_future)
+
     def process(self, addr, play, stage, request_handler) -> bool:
         if addr not in play.states:
             return False
@@ -481,11 +539,7 @@ class StateMachine:
                     logger.debug(f"actor({addr}) request({request}) satisfied: {msg}")
                     if tfut:
                         tfut.cancel()
-                    resp_future = Future()
-                    resp_future.set_result(msg)
-                    play.states[addr] = State.Awaiting(
-                        request=request, response_future=resp_future
-                    )
+                    self.resolve(addr, request, msg, play)
                     return True
             case _:
                 return False
@@ -605,18 +659,15 @@ class Theatre:
                     case State.Terminated():
                         pass
                     case _:
-                        self._sm.cancel_pending_task(actor, play)
-                        play.states[actor] = State.Terminated(cause=signal)
+                        self._sm.terminate(actor, signal, play)
             case Signal.INT:
                 match play.states[actor]:
                     case State.Terminated():
                         pass
                     case _:
-                        self._sm.cancel_pending_task(actor, play)
-                        exec_future = self._stage.submit_performance(
-                            actor, sheet.performance.throw, ActorCancelled(actor)
+                        self._sm.interrupt(
+                            actor, ActorCancelled(actor), play, self._stage
                         )
-                        play.states[actor] = State.Executing(exec_future)
             case _:
                 raise NotImplementedError()
 
@@ -627,34 +678,20 @@ class Theatre:
         match request:
             case System.exit(value):
                 self._logger.debug(f"actor({addr}) terminated with value {value}")
-                play.states[addr] = State.Terminated(cause=NormalExit(value))
+                self._sm.terminate(addr, NormalExit(value), play)
             case System.spawn_link(script, props):
                 child = self._spawn(script, props, play=play)
                 self._link(addr, child, play)
-                resp_future = Future()
-                resp_future.set_result(child)
-                play.states[addr] = State.Awaiting(
-                    request=request, response_future=resp_future
-                )
+                self._sm.resolve(addr, request, child, play)
             case System.spawn(script, props):
                 child = self._spawn(script, props, play=play)
-                resp_future = Future()
-                resp_future.set_result(child)
-                play.states[addr] = State.Awaiting(
-                    request=request, response_future=resp_future
-                )
+                self._sm.resolve(addr, request, child, play)
             case System.whoami():
-                resp_future = Future()
-                resp_future.set_result(addr)
-                play.states[addr] = State.Awaiting(
-                    request=request, response_future=resp_future
-                )
+                self._sm.resolve(addr, request, addr, play)
             case System.send(dest_addr, msg):
                 resp_future = Future()
                 self._send(dest_addr, msg, resp_future, play)
-                play.states[addr] = State.Awaiting(
-                    request=request, response_future=resp_future
-                )
+                self._sm.await_future(addr, request, resp_future, play)
             case System.receive(filter=filter_fn, timeout=timeout):
                 try:
                     msg = sheet.mailbox.pop_matching(filter_fn)
@@ -667,23 +704,17 @@ class Theatre:
                         self._logger.debug(
                             f"actor({addr}): Scheduling timeout for receive request in {timeout}s"
                         )
-                        # setup timeout task
                         interrupt = threading.Event()
 
                         def delayed():
                             if interrupt.wait(timeout=timeout):
-                                # interrupt was set, timeout was cancelled
                                 return
                             else:
-                                # interrupt was not set, wait terminated by timeout
                                 raise ReceiveTimeout(request)
 
                         fut = self._stage.executor.submit(delayed)
                         timeout_task = CancellableTask(future=fut, interrupt=interrupt)
 
-                        # on completion, timeout event is queued
-                        # event handler should check that actor is still in Receiving state
-                        # and handling MessageReceived should cancel corresponding timeout task
                         def timeout_callback(f):
                             self._logger.debug(
                                 f"Receive timeout triggered ({f.cancelled()=},{f.exception()=})"
@@ -698,18 +729,12 @@ class Theatre:
                                 )
 
                         fut.add_done_callback(timeout_callback)
-                    play.states[addr] = State.Receiving(
-                        request=request, timeout_task=timeout_task
-                    )
+                    self._sm.park(addr, request, timeout_task, play)
                 else:
                     self._logger.debug(
                         f"actor({addr}) request {request} satisfied directly: {msg}"
                     )
-                    resp_future = Future()
-                    resp_future.set_result(msg)
-                    play.states[addr] = State.Awaiting(
-                        request=request, response_future=resp_future
-                    )
+                    self._sm.resolve(addr, request, msg, play)
             case System.sleep(n):
                 interrupt = threading.Event()
 
@@ -720,28 +745,20 @@ class Theatre:
                 resp_future = self._stage.submit_request(
                     addr, request, delayed, interrupt=interrupt
                 )
-                play.states[addr] = State.Awaiting(
-                    request=request, response_future=resp_future
-                )
+                self._sm.await_future(addr, request, resp_future, play)
             case System.link(target=actor):
                 if actor not in play.states:
-                    # target actor does not exist
-                    future = self._stage.submit_performance(
-                        addr, sheet.performance.throw, DestinationNotFound(actor)
+                    self._sm.resume_with_error(
+                        addr, DestinationNotFound(actor), play, self._stage
                     )
-                    play.states[addr] = State.Executing(future=future)
                 else:
                     self._link(addr, actor, play)
-                    future = self._stage.submit_performance(
-                        addr, sheet.performance.send, None
-                    )
-                    play.states[addr] = State.Executing(future=future)
+                    self._sm.resume_with_value(addr, None, play, self._stage)
             case _:
                 self._logger.debug(f"unexpected request {request}")
-                future = self._stage.submit_performance(
-                    addr, sheet.performance.throw, UnsupportedRequest(addr, request)
+                self._sm.resume_with_error(
+                    addr, UnsupportedRequest(addr, request), play, self._stage
                 )
-                play.states[addr] = State.Executing(future=future)
 
     def _handle_external_request(self, request, result_future: Future, play: Play):
         match request:
@@ -823,7 +840,6 @@ class Theatre:
                         self._handle_signal(actor, signal, play)
                         self._sm.chain(actor, play, self._stage, self._handle_request)
             case Event.LinkTrap(linker, linked, future):
-                linker_sheet = play.actors[linker]
                 linker_state = play.states[linker]
                 self._logger.debug(
                     f"handling link trap: target({linked}) -> owner({linker}, state={linker_state})"
@@ -833,46 +849,11 @@ class Theatre:
                         self._logger.debug(
                             f"Link owner {linker} terminated before handling link trap for target {linked}"
                         )
-                    case State.Executing(exec_future):
-                        self._logger.debug(
-                            f"link owner {linker} in Executing state, chaining trap propagation"
-                        )
-
-                        def exec_chain():
-                            try:
-                                req = exec_future.result()
-                            except Exception:
-                                raise
-                            else:
-                                self._logger.debug(
-                                    f"actor({linker}): ignoring request {req} to signal link trap from {linked}"
-                                )
-                                linker_sheet.performance.throw(
-                                    ActorTerminated(linked, future.result())
-                                )
-
-                        new_exec_future = self._stage.submit_performance(
-                            linker, exec_chain
-                        )
-                        play.states[linker] = State.Executing(new_exec_future)
-                    case State.Awaiting(response_future=fut):
-                        self._logger.debug(
-                            f"link owner {linker} in Awaiting state, cancelling task and propagating trap"
-                        )
-                        fut.cancel()
-                        exec_future = self._stage.submit_performance(
-                            linker,
-                            linker_sheet.performance.throw,
-                            ActorTerminated(linked, future.result()),
-                        )
-                        play.states[linker] = State.Executing(exec_future)
                     case _:
-                        exec_future = self._stage.submit_performance(
-                            linker,
-                            linker_sheet.performance.throw,
-                            ActorTerminated(linked, future.result()),
+                        cause = future.result()
+                        self._sm.interrupt(
+                            linker, ActorTerminated(linked, cause), play, self._stage
                         )
-                        play.states[linker] = State.Executing(exec_future)
                 self._sm.chain(linker, play, self._stage, self._handle_request)
             case Event.ReceiveTimeout(
                 actor=actor, request=request, timeout_task=future
@@ -890,12 +871,9 @@ class Theatre:
                         self._logger.debug(
                             f"actor({actor}): receive request {req} timed out"
                         )
-                        exec_future = self._stage.submit_performance(
-                            actor,
-                            sheet.performance.throw,
-                            ReceiveTimeout(request=req),
+                        self._sm.interrupt(
+                            actor, ReceiveTimeout(request=req), play, self._stage
                         )
-                        play.states[actor] = State.Executing(exec_future)
                     case _:
                         self._logger.debug(
                             f"actor({actor}): ignoring stale receive timeout while actor in state {state}"
@@ -1013,11 +991,7 @@ class Theatre:
         play = play or self._play
         sheet = self._create_actor(script, props)
         play.actors[sheet.address] = sheet
-        play.states[sheet.address] = State.Init(
-            future=self._stage.submit_performance(
-                sheet.address, sheet.performance.send, None
-            )
-        )
+        self._sm.initiate(sheet.address, play, self._stage)
         return sheet.address
 
     def _request(self, request):
