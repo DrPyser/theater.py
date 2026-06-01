@@ -304,6 +304,35 @@ class Play:
     conditions: list[Event.RegisterCondition] = field(default_factory=list)
 
 
+@dataclass
+class Stage:
+    executor: Executor
+    events: queue.Queue
+    logger: logging.Logger
+
+    def submit_performance(self, addr, fn, *args, interrupt=None):
+        self.logger.debug(
+            f"submitting performance for actor {addr}: {fn.__qualname__}{args!r}"
+        )
+        fut = self.executor.submit(fn, *args)
+        fut.add_done_callback(
+            lambda f: self.events.put(Event.EndOfScene(actor=addr, future=f))
+        )
+        return CancellableTask(future=fut, interrupt=interrupt)
+
+    def submit_request(self, addr, request, fn, *args, interrupt=None):
+        self.logger.debug(
+            f"submitting request for actor {addr}: {request!r} ({fn.__qualname__}{args})"
+        )
+        fut = self.executor.submit(fn, *args)
+        task = CancellableTask(future=fut, interrupt=interrupt)
+        fut.add_done_callback(
+            lambda f: self.events.put(
+                Event.RequestCompleted(actor=addr, request=request, future=task)
+            )
+        )
+        return task
+
 @dataclass(frozen=True)
 class ActorInfo:
     address: ActorAddress
@@ -339,6 +368,9 @@ class Theatre:
         self._logger = logger.getChild(str(id(self)))
         self._counter = itertools.count()
         self._events = queue.Queue()
+        self._stage = Stage(
+            executor=self.executor, events=self._events, logger=self._logger
+        )
         # set when starting run loop
         self._play = None
         self._thread = None
@@ -349,29 +381,6 @@ class Theatre:
     def make_addr(self, performance) -> ActorAddress:
         addr = ActorAddress(os.getpid(), id(self), id(performance))
         return addr
-
-    def _submit_performance(self, addr, fn, *args, interrupt=None):
-        self._logger.debug(
-            f"submitting performance for actor {addr}: {fn.__qualname__}{args!r}"
-        )
-        fut = self.executor.submit(fn, *args)
-        fut.add_done_callback(
-            lambda f: self._events.put(Event.EndOfScene(actor=addr, future=f))
-        )
-        return CancellableTask(future=fut, interrupt=interrupt)
-
-    def _submit_request(self, addr, request, fn, *args, interrupt=None):
-        self._logger.debug(
-            f"submitting request for actor {addr}: {request!r} ({fn.__qualname__}{args})"
-        )
-        fut = self.executor.submit(fn, *args)
-        task = CancellableTask(future=fut, interrupt=interrupt)
-        fut.add_done_callback(
-            lambda f: self._events.put(
-                Event.RequestCompleted(actor=addr, request=request, future=task)
-            )
-        )
-        return task
 
     def _create_actor(self, script, props):
         mailbox = Mailbox(maxlen=self.queue_size)
@@ -466,6 +475,7 @@ class Theatre:
                     case _:
                         self._cancel_pending_task(actor, play)
                         exec_future = self._submit_performance(
+                        exec_future = self._stage.submit_performance(
                             actor, sheet.performance.throw, ActorCancelled(actor)
                         )
                         play.states[actor] = State.Executing(exec_future)
@@ -530,7 +540,7 @@ class Theatre:
                                 # interrupt was not set, wait terminated by timeout
                                 raise ReceiveTimeout(request)
 
-                        fut = self.executor.submit(delayed)
+                        fut = self._stage.executor.submit(delayed)
                         timeout_task = CancellableTask(future=fut, interrupt=interrupt)
 
                         # on completion, timeout event is queued
@@ -569,7 +579,7 @@ class Theatre:
                     if interrupt.wait(timeout=n):
                         raise ActorCancelled(addr)
 
-                resp_future = self._submit_request(
+                resp_future = self._stage.submit_request(
                     addr, request, delayed, interrupt=interrupt
                 )
                 play.states[addr] = State.Awaiting(
@@ -578,19 +588,19 @@ class Theatre:
             case System.link(target=actor):
                 if actor not in play.states:
                     # target actor does not exist
-                    future = self._submit_performance(
+                    future = self._stage.submit_performance(
                         addr, sheet.performance.throw, DestinationNotFound(actor)
                     )
                     play.states[addr] = State.Executing(future=future)
                 else:
                     self._link(addr, actor, play)
-                    future = self._submit_performance(
+                    future = self._stage.submit_performance(
                         addr, sheet.performance.send, None
                     )
                     play.states[addr] = State.Executing(future=future)
             case _:
                 self._logger.debug(f"unexpected request {request}")
-                future = self._submit_performance(
+                future = self._stage.submit_performance(
                     addr, sheet.performance.throw, UnsupportedRequest(addr, request)
                 )
                 play.states[addr] = State.Executing(future=future)
@@ -644,19 +654,19 @@ class Theatre:
                 self._logger.debug(f"actor({addr}) request({req}) response ready")
                 if fut.cancelled():
                     self._logger.debug(f"actor({addr}) request({req}) cancelled")
-                    exec_future = self._submit_performance(
+                    exec_future = self._stage.submit_performance(
                         addr, sheet.performance.throw, RequestCancelled(req)
                     )
                 elif exception := fut.exception():
                     self._logger.debug(
                         f"actor({addr}) request({req}) failed: {exception}"
                     )
-                    exec_future = self._submit_performance(
+                    exec_future = self._stage.submit_performance(
                         addr, sheet.performance.throw, exception
                     )
                 else:
                     self._logger.debug(f"actor({addr}) request({req}) succeeded")
-                    exec_future = self._submit_performance(
+                    exec_future = self._stage.submit_performance(
                         addr, sheet.performance.send, fut.result()
                     )
 
@@ -866,21 +876,23 @@ class Theatre:
                                     ActorTerminated(linked, future.result())
                                 )
 
-                        new_exec_future = self._submit_performance(linker, exec_chain)
+                        new_exec_future = self._stage.submit_performance(
+                            linker, exec_chain
+                        )
                         play.states[linker] = State.Executing(new_exec_future)
                     case State.Awaiting(response_future=fut):
                         self._logger.debug(
                             f"link owner {linker} in Awaiting state, cancelling task and propagating trap"
                         )
                         fut.cancel()
-                        exec_future = self._submit_performance(
+                        exec_future = self._stage.submit_performance(
                             linker,
                             linker_sheet.performance.throw,
                             ActorTerminated(linked, future.result()),
                         )
                         play.states[linker] = State.Executing(exec_future)
                     case _:
-                        exec_future = self._submit_performance(
+                        exec_future = self._stage.submit_performance(
                             linker,
                             linker_sheet.performance.throw,
                             ActorTerminated(linked, future.result()),
@@ -903,7 +915,7 @@ class Theatre:
                         self._logger.debug(
                             f"actor({actor}): receive request {req} timed out"
                         )
-                        exec_future = self._submit_performance(
+                        exec_future = self._stage.submit_performance(
                             actor,
                             sheet.performance.throw,
                             ReceiveTimeout(request=req),
@@ -1027,7 +1039,9 @@ class Theatre:
         sheet = self._create_actor(script, props)
         play.actors[sheet.address] = sheet
         play.states[sheet.address] = State.Init(
-            future=self._submit_performance(sheet.address, sheet.performance.send, None)
+            future=self._stage.submit_performance(
+                sheet.address, sheet.performance.send, None
+            )
         )
         return sheet.address
 
