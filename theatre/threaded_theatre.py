@@ -333,6 +333,164 @@ class Stage:
         )
         return task
 
+
+class StateMachine:
+    def cancel_pending_task(self, actor, play):
+        state = play.states[actor]
+        logger.debug(f"actor({actor}): cancelling pending tasks for state {state}")
+        match state:
+            case State.Receiving(timeout_task=tfut):
+                if tfut:
+                    tfut.cancel()
+            case (
+                State.Init(future)
+                | State.Awaiting(response_future=future)
+                | State.Executing(future)
+            ):
+                future.cancel()
+            case _:
+                pass
+
+    def process(self, addr, play, stage, request_handler) -> bool:
+        if addr not in play.states:
+            return False
+        state = play.states[addr]
+        sheet = play.actors[addr]
+
+        match state:
+            case State.Init(future) if future.done():
+                try:
+                    req = future.result()
+                except StopIteration as ex:
+                    play.states[addr] = State.Terminated(cause=NormalExit(ex.value))
+                    logger.debug(
+                        f"actor {addr} terminated during init with value {ex.value}"
+                    )
+                except CancelledError as ex:
+                    logger.debug(f"actor {addr} cancelled during init")
+                    wrap = ActorCancelled(addr)
+                    wrap.__cause__ = wrap.__context__ = ex
+                    play.states[addr] = State.Terminated(cause=ErrorExit(wrap))
+                except Exception as ex:
+                    play.states[addr] = State.Terminated(cause=ErrorExit(ex))
+                    logger.debug(f"actor {addr} died during init: {ex}")
+                else:
+                    play.states[addr] = State.Waiting(request=req)
+                    logger.debug(f"actor {addr} initialized, pending request {req}")
+                return True
+
+            case State.Waiting(request=req):
+                request_handler(addr, req, play)
+                return True
+
+            case State.Awaiting(request=req, response_future=fut) if fut.done():
+                logger.debug(f"actor({addr}) request({req}) response ready")
+                if fut.cancelled():
+                    logger.debug(f"actor({addr}) request({req}) cancelled")
+                    exec_future = stage.submit_performance(
+                        addr, sheet.performance.throw, RequestCancelled(req)
+                    )
+                elif exception := fut.exception():
+                    logger.debug(f"actor({addr}) request({req}) failed: {exception}")
+                    exec_future = stage.submit_performance(
+                        addr, sheet.performance.throw, exception
+                    )
+                else:
+                    logger.debug(f"actor({addr}) request({req}) succeeded")
+                    exec_future = stage.submit_performance(
+                        addr, sheet.performance.send, fut.result()
+                    )
+
+                play.states[addr] = State.Executing(future=exec_future)
+                return True
+
+            case State.Executing(future=fut) if fut.done():
+                try:
+                    req = fut.result()
+                except StopIteration as ex:
+                    play.states[addr] = State.Terminated(cause=NormalExit(ex.value))
+                    logger.debug(f"actor {addr} terminated with value {ex.value}")
+                except Exception as ex:
+                    play.states[addr] = State.Terminated(cause=ErrorExit(ex))
+                    logger.debug(f"actor {addr} died: {ex}")
+                else:
+                    play.states[addr] = State.Waiting(request=req)
+                    logger.debug(f"actor {addr} now pending request {req}")
+                return True
+
+            case State.Executing(future=fut):
+                logger.debug(f"actor({addr}) still executing (future {fut})")
+                return False
+
+            case State.Receiving(request=request, timeout_task=tfut):
+                logger.debug(
+                    f"actor ({addr}) still in Receiving state for request {request=}"
+                )
+                assert not tfut or not tfut.cancelled(), (
+                    "Receiving state should not be observed with cancelled timeout"
+                )
+                if tfut and tfut.done():
+                    logger.debug(
+                        f"actor({addr}): Receiving state observed with completed timeout task"
+                    )
+                    pass
+                return False
+
+            case State.Terminated(cause=cause):
+                match cause:
+                    case ErrorExit(error):
+                        logger.debug(f"actor {addr} terminated with error: {error}")
+                    case NormalExit(value):
+                        logger.debug(f"actor {addr} terminated with value {value}")
+                    case Signal():
+                        logger.debug(f"actor({addr}) terminated with signal {cause}")
+                return False
+
+    def chain(self, addr, play, stage, request_handler):
+        logger.debug(f"Chaining transitions for actor {addr}")
+        state = play.states[addr]
+        while self.process(addr, play, stage, request_handler):
+            if addr not in play.states:
+                logger.debug(
+                    f"State of actor {addr} disappeared during transition from state {state}"
+                )
+                break
+            logger.debug(f"Transitioned actor {addr}: {state} -> {play.states[addr]}")
+            state = play.states[addr]
+
+    def deliver_message(self, addr, play):
+        """Try to satisfy a Receiving actor with a mailbox message.
+        Returns True if a message was delivered and state transitioned."""
+        if addr not in play.states:
+            return False
+        actor_state = play.states[addr]
+        match actor_state:
+            case State.Receiving(request=request, timeout_task=tfut):
+                if tfut and tfut.done():
+                    return False
+                sheet = play.actors[addr]
+                filter_fn = (
+                    request.filter if isinstance(request, System.receive) else None
+                )
+                try:
+                    msg = sheet.mailbox.pop_matching(filter_fn)
+                except _NoMatch:
+                    logger.debug(f"actor({addr}) request({request}) still unsatisfied")
+                    return False
+                else:
+                    logger.debug(f"actor({addr}) request({request}) satisfied: {msg}")
+                    if tfut:
+                        tfut.cancel()
+                    resp_future = Future()
+                    resp_future.set_result(msg)
+                    play.states[addr] = State.Awaiting(
+                        request=request, response_future=resp_future
+                    )
+                    return True
+            case _:
+                return False
+
+
 @dataclass(frozen=True)
 class ActorInfo:
     address: ActorAddress
@@ -343,9 +501,7 @@ class ActorInfo:
     exit_cause: Exit | Signal | None = None
 
     @classmethod
-    def from_run_state(
-        cls, sheet: ActorSheet, state: ActorState
-    ) -> ActorInfo:
+    def from_run_state(cls, sheet: ActorSheet, state: ActorState) -> ActorInfo:
         return cls(
             address=sheet.address,
             script=getattr(sheet.script, "__qualname__", str(sheet.script)),
@@ -371,6 +527,7 @@ class Theatre:
         self._stage = Stage(
             executor=self.executor, events=self._events, logger=self._logger
         )
+        self._sm = StateMachine()
         # set when starting run loop
         self._play = None
         self._thread = None
@@ -422,24 +579,6 @@ class Theatre:
         )
         play.conditions.append(condition)
 
-    def _cancel_pending_task(self, actor, play):
-        state = play.states[actor]
-        self._logger.debug(
-            f"actor({actor}): cancelling pending tasks for state {state}"
-        )
-        match state:
-            case State.Receiving(timeout_task=tfut):
-                if tfut:
-                    tfut.cancel()
-            case (
-                State.Init(future)
-                | State.Awaiting(response_future=future)
-                | State.Executing(future)
-            ):
-                future.cancel()
-            case _:  # no pending future or state to cleanup
-                pass
-
     def _send(self, address: ActorAddress, message, future: Future, play: Play):
         if destination := play.actors.get(address):
             match play.states[address]:
@@ -466,15 +605,14 @@ class Theatre:
                     case State.Terminated():
                         pass
                     case _:
-                        self._cancel_pending_task(actor, play)
+                        self._sm.cancel_pending_task(actor, play)
                         play.states[actor] = State.Terminated(cause=signal)
             case Signal.INT:
                 match play.states[actor]:
                     case State.Terminated():
                         pass
                     case _:
-                        self._cancel_pending_task(actor, play)
-                        exec_future = self._submit_performance(
+                        self._sm.cancel_pending_task(actor, play)
                         exec_future = self._stage.submit_performance(
                             actor, sheet.performance.throw, ActorCancelled(actor)
                         )
@@ -610,135 +748,11 @@ class Theatre:
             case System.spawn(script, props):
                 address = self._spawn(script=script, props=props)
                 result_future.set_result(address)
-                self._chain_transitions(address, play)
+                self._sm.chain(address, play, self._stage, self._handle_request)
             case System.send(address, message):
                 self._send(address, message, result_future, play)
             case _:
                 result_future.set_exception(NotImplementedError(request))
-
-    def _process_state(self, addr: ActorAddress, play: Play) -> bool:
-        if addr not in play.states:
-            return False
-        state = play.states[addr]
-        sheet = play.actors[addr]
-
-        match state:
-            case State.Init(future) if future.done():
-                try:
-                    req = future.result()
-                except StopIteration as ex:
-                    play.states[addr] = State.Terminated(cause=NormalExit(ex.value))
-                    self._logger.debug(
-                        f"actor {addr} terminated during init with value {ex.value}"
-                    )
-                except CancelledError as ex:
-                    self._logger.debug(f"actor {addr} cancelled during init")
-                    wrap = ActorCancelled(addr)
-                    wrap.__cause__ = wrap.__context__ = ex
-                    play.states[addr] = State.Terminated(cause=ErrorExit(wrap))
-                except Exception as ex:
-                    play.states[addr] = State.Terminated(cause=ErrorExit(ex))
-                    self._logger.debug(f"actor {addr} died during init: {ex}")
-                else:
-                    play.states[addr] = State.Waiting(request=req)
-                    self._logger.debug(
-                        f"actor {addr} initialized, pending request {req}"
-                    )
-                return True
-
-            case State.Waiting(request=req):
-                self._handle_request(addr, req, play)
-                return True
-
-            case State.Awaiting(request=req, response_future=fut) if fut.done():
-                self._logger.debug(f"actor({addr}) request({req}) response ready")
-                if fut.cancelled():
-                    self._logger.debug(f"actor({addr}) request({req}) cancelled")
-                    exec_future = self._stage.submit_performance(
-                        addr, sheet.performance.throw, RequestCancelled(req)
-                    )
-                elif exception := fut.exception():
-                    self._logger.debug(
-                        f"actor({addr}) request({req}) failed: {exception}"
-                    )
-                    exec_future = self._stage.submit_performance(
-                        addr, sheet.performance.throw, exception
-                    )
-                else:
-                    self._logger.debug(f"actor({addr}) request({req}) succeeded")
-                    exec_future = self._stage.submit_performance(
-                        addr, sheet.performance.send, fut.result()
-                    )
-
-                play.states[addr] = State.Executing(future=exec_future)
-                return True
-
-            case State.Executing(future=fut) if fut.done():
-                try:
-                    req = fut.result()
-                except StopIteration as ex:
-                    play.states[addr] = State.Terminated(cause=NormalExit(ex.value))
-                    self._logger.debug(f"actor {addr} terminated with value {ex.value}")
-                except Exception as ex:
-                    play.states[addr] = State.Terminated(cause=ErrorExit(ex))
-                    self._logger.debug(f"actor {addr} died: {ex}")
-                else:
-                    play.states[addr] = State.Waiting(request=req)
-                    self._logger.debug(f"actor {addr} now pending request {req}")
-                return True
-
-            case State.Executing(future=fut):
-                self._logger.debug(f"actor({addr}) still executing (future {fut})")
-                return False
-
-            case State.Receiving(request=request, timeout_task=tfut):
-                self._logger.debug(
-                    f"actor ({addr}) still in Receiving state for request {request=}"
-                )
-                assert not tfut or not tfut.cancelled(), (
-                    "Receiving state should not be observed with cancelled timeout"
-                )
-                if tfut and tfut.done():
-                    # TODO: can throw to actor now
-                    # leaving it to callback event handler to propagate to actor
-                    # and transition state
-                    self._logger.debug(
-                        f"actor({addr}): Receiving state observed with completed timeout task"
-                    )
-                    pass
-
-                return False
-
-            case State.Terminated(cause=cause):
-                match cause:
-                    case ErrorExit(error):
-                        self._logger.debug(
-                            f"actor {addr} terminated with error: {error}"
-                        )
-                    case NormalExit(value):
-                        self._logger.debug(
-                            f"actor {addr} terminated with value {value}"
-                        )
-                    case Signal():
-                        self._logger.debug(
-                            f"actor({addr}) terminated with signal {cause}"
-                        )
-                # TODO: handle terminated actors (links, cleanup)
-                return False
-
-    def _chain_transitions(self, actor: ActorAddress, play: Play) -> None:
-        self._logger.debug(f"Chaining transitions for actor {actor}")
-        state = play.states[actor]
-        while self._process_state(actor, play):
-            if actor not in play.states:
-                self._logger.debug(
-                    f"State of actor {actor} disappeared during transition from state {state}"
-                )
-                break
-            self._logger.debug(
-                f"Transitioned actor {actor}: {state} -> {play.states[actor]}"
-            )
-            state = play.states[actor]
 
     def _handle_event(self, event: Event, play: Play) -> None:
         self._logger.debug(f"Handling event {event=}")
@@ -761,7 +775,7 @@ class Theatre:
                             self._logger.debug(
                                 f"Stale event: actor {actor} state has different future {fut}"
                             )
-                        self._chain_transitions(actor, play)
+                        self._sm.chain(actor, play, self._stage, self._handle_request)
                         return
                     case State.Receiving():
                         # already transitioned to Receiving state from receive request
@@ -783,7 +797,7 @@ class Theatre:
                             self._logger.debug(
                                 f"Stale event: actor {actor} state has different future {fut}"
                             )
-                        self._chain_transitions(actor, play)
+                        self._sm.chain(actor, play, self._stage, self._handle_request)
                     case state:
                         self._logger.debug(
                             f"Stale event: actor {actor} has unexpected state {state}"
@@ -793,47 +807,8 @@ class Theatre:
                 self._logger.debug(
                     f"actor({actor}) mailbox now has {len(play.actors[actor].mailbox)} messages"
                 )
-                if actor not in play.states:
-                    self._logger.debug(f"Stale event: actor {actor} gone")
-                    return
-                actor_state = play.states[actor]
-                match actor_state:
-                    case State.Receiving(request=request, timeout_task=tfut):
-                        sheet = play.actors[actor]
-                        if tfut and tfut.done():
-                            # timeout expired but event not processed yet
-                            # skip and let event be processed
-                            self._logger.debug(
-                                f"actor({actor}): message received but timeout already triggered"
-                            )
-                            return
-                        filter_fn = (
-                            request.filter
-                            if isinstance(request, System.receive)
-                            else None
-                        )
-                        try:
-                            msg = sheet.mailbox.pop_matching(filter_fn)
-                        except _NoMatch:
-                            self._logger.debug(
-                                f"actor({actor}) request({request}) still insatisfied"
-                            )
-                            pass
-                        else:
-                            self._logger.debug(
-                                f"actor({actor}) request({request}) satisfied: {msg}"
-                            )
-                            if tfut:
-                                tfut.cancel()
-                            resp_future = Future()
-                            resp_future.set_result(msg)
-                            play.states[actor] = State.Awaiting(
-                                request=request, response_future=resp_future
-                            )
-                            self._chain_transitions(actor, play)
-                    case _:
-                        self._logger.debug(f"actor({actor}) not in Receiving state")
-                        pass
+                if self._sm.deliver_message(actor, play):
+                    self._sm.chain(actor, play, self._stage, self._handle_request)
             case Event.RegisterCondition():
                 self._play.conditions.append(event)
             case Event.ExternalRequest(request, result_future):
@@ -841,12 +816,12 @@ class Theatre:
             case Event.Signal(actor, signal):
                 if not isinstance(play.states[actor], State.Terminated):
                     self._handle_signal(actor, signal, play)
-                    self._chain_transitions(actor, play)
+                    self._sm.chain(actor, play, self._stage, self._handle_request)
             case Event.SignalAll(signal):
                 for actor in play.actors:
                     if not isinstance(play.states[actor], State.Terminated):
                         self._handle_signal(actor, signal, play)
-                        self._chain_transitions(actor, play)
+                        self._sm.chain(actor, play, self._stage, self._handle_request)
             case Event.LinkTrap(linker, linked, future):
                 linker_sheet = play.actors[linker]
                 linker_state = play.states[linker]
@@ -898,7 +873,7 @@ class Theatre:
                             ActorTerminated(linked, future.result()),
                         )
                         play.states[linker] = State.Executing(exec_future)
-                self._chain_transitions(linker, play)
+                self._sm.chain(linker, play, self._stage, self._handle_request)
             case Event.ReceiveTimeout(
                 actor=actor, request=request, timeout_task=future
             ):
@@ -925,7 +900,7 @@ class Theatre:
                         self._logger.debug(
                             f"actor({actor}): ignoring stale receive timeout while actor in state {state}"
                         )
-                self._chain_transitions(actor, play)
+                self._sm.chain(actor, play, self._stage, self._handle_request)
             case _:
                 self._logger.debug(f"Unknown event {event=}")
 
