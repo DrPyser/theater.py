@@ -362,12 +362,15 @@ class StateMachine:
         play.states[addr] = State.Awaiting(request=request, response_future=resp_future)
 
     def await_future(self, addr, request, future, play):
+        assert isinstance(play.states[addr], State.Waiting)
         play.states[addr] = State.Awaiting(request=request, response_future=future)
 
     def park(self, addr, request, timeout_task, play):
+        assert isinstance(play.states[addr], State.Waiting)
         play.states[addr] = State.Receiving(request=request, timeout_task=timeout_task)
 
     def initiate(self, addr, play, stage):
+        assert addr not in play.states
         sheet = play.actors[addr]
         future = stage.submit_performance(addr, sheet.performance.send, None)
         play.states[addr] = State.Init(future=future)
