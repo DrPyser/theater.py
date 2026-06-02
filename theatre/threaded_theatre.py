@@ -966,18 +966,20 @@ class Theatre:
         stop_reason = None
         loop_count = itertools.count()
         idle_count = 0
+        cnt = 0
         events = []
         try:
             assert self._play
 
             while not stop_reason:
+                cnt = next(loop_count)
                 if self.max_idle and idle_count >= self.max_idle:
                     self._logger.debug(
-                        f"Reached max idle count ({self.max_idle=}), stopping"
+                        f"(%d) Reached max idle count ({self.max_idle=}), stopping",
+                        cnt
                     )
                     stop_reason = "idle"
                     break
-                cnt = next(loop_count)
                 self._logger.debug(f"Running main loop ({cnt})")
                 alive_count = sum(
                     1
@@ -1005,12 +1007,13 @@ class Theatre:
                 self._process_conditions(self._play)
         except Event.Stop as ex:
             self._logger.info(
-                f"({loop_count}) Stop signal received, terminating event loop: %s",
+                "(%d) Stop signal received, terminating event loop: %s",
+                cnt,
                 ex
             )
             stop_reason = ("signal", ex)
         except BaseException as ex:
-            self._logger.exception("(%d) Theatre run loop raised exception: %s", loop_count, ex)
+            self._logger.exception("(%d) Theatre run loop raised exception: %s", cnt, ex)
             stop_reason = ("error", ex)
             raise
         finally:
