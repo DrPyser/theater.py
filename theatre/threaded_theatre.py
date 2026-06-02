@@ -189,6 +189,32 @@ class Event:
         timeout_task: CancellableTask
 
 
+class RequestResult:
+    """
+    request handling resolution state
+    """
+    @dataclass
+    class Terminate:
+        cause: Exit | Signal
+
+    @dataclass
+    class AwaitFuture:
+        request: object
+        future: CancellableTask
+
+    @dataclass
+    class Park:
+        request: object
+        timeout_task: CancellableTask | None
+
+    @dataclass
+    class ResumeWithValue:
+        value: Any
+
+    @dataclass
+    class ResumeWithError:
+        exc: BaseException
+
 @dataclass
 class NormalExit:
     value: Any
@@ -400,7 +426,7 @@ class StateMachine:
                     # to signal the interruption on the next opportunity
                     def exec_chain():
                         result = fut.result()
-                        stage.logger.debug("actor({addr}): dismissing request %s to signal interruption")
+                        stage.logger.debug("actor(%s): dismissing request %s to signal interruption", addr, result)
                         sheet.performance.throw(exc)
 
                     exec_future = stage.submit_performance(addr, exec_chain)
@@ -442,7 +468,19 @@ class StateMachine:
                 return True
 
             case State.Waiting(request=req):
-                request_handler(addr, req, play)
+                match request_handler(addr, req, play):
+                    case RequestResult.Terminate(cause):
+                        self.terminate(addr, cause, play)
+                    case RequestResult.AwaitFuture(request, future):
+                        self.await_future(addr, request, future, play)
+                    case RequestResult.Park(request, timeout_task):
+                        self.park(addr, request, timeout_task, play)
+                    case RequestResult.ResumeWithValue(value):
+                        self.resume_with_value(addr, value, play, stage)
+                    case RequestResult.ResumeWithError(exc):
+                        self.resume_with_error(addr, exc, play, stage)
+                    case result:
+                        raise RuntimeError(f"Unexpected request handling outcome: {result}")
                 return True
 
             case State.Awaiting(request=req, response_future=fut) if fut.done():
@@ -637,21 +675,21 @@ class Theatre:
         )
         play.conditions.append(condition)
 
-    def _send(self, address: ActorAddress, message, future: Future, play: Play):
+    def _send(self, address: ActorAddress, message: Any, play: Play):
         if destination := play.actors.get(address):
             match play.states[address]:
                 case State.Terminated(cause=cause):
-                    future.set_exception(ActorTerminated(address, cause))
+                    raise ActorTerminated(address, cause)
                 case _:
                     try:
                         destination.mailbox.append(message)
                     except MailboxFull as ex:
-                        future.set_exception(ex)
+                        raise
                     else:
                         self._events.put(Event.MessageDelivered(actor=address))
-                        future.set_result(None)
+                        return
         else:
-            future.set_exception(DestinationNotFound(address))
+            raise DestinationNotFound(address)
 
     def _handle_signal(self, actor: ActorAddress, signal: Signal, play: Play):
         sheet = play.actors[actor]
@@ -682,20 +720,23 @@ class Theatre:
         match request:
             case System.exit(value):
                 self._logger.debug(f"actor({addr}) terminated with value {value}")
-                self._sm.terminate(addr, NormalExit(value), play)
+                return RequestResult.Terminate(NormalExit(value))
             case System.spawn_link(script, props):
                 child = self._spawn(script, props, play=play)
                 self._link(addr, child, play)
-                self._sm.resolve(addr, request, child, play)
+                return RequestResult.ResumeWithValue(child)
             case System.spawn(script, props):
                 child = self._spawn(script, props, play=play)
-                self._sm.resolve(addr, request, child, play)
+                return RequestResult.ResumeWithValue(child)
             case System.whoami():
-                self._sm.resolve(addr, request, addr, play)
+                return RequestResult.ResumeWithValue(addr)
             case System.send(dest_addr, msg):
-                resp_future = Future()
-                self._send(dest_addr, msg, resp_future, play)
-                self._sm.await_future(addr, request, resp_future, play)
+                try:
+                    self._send(dest_addr, msg, play)
+                except Exception as ex:
+                    return RequestResult.ResumeWithError(ex)
+                else:
+                    return RequestResult.ResumeWithValue(None)
             case System.receive(filter=filter_fn, timeout=timeout):
                 try:
                     msg = sheet.mailbox.pop_matching(filter_fn)
@@ -733,12 +774,12 @@ class Theatre:
                                 )
 
                         fut.add_done_callback(timeout_callback)
-                    self._sm.park(addr, request, timeout_task, play)
+                    return RequestResult.Park(request, timeout_task)
                 else:
                     self._logger.debug(
                         f"actor({addr}) request {request} satisfied directly: {msg}"
                     )
-                    self._sm.resolve(addr, request, msg, play)
+                    return RequestResult.ResumeWithValue(msg)
             case System.sleep(n):
                 interrupt = threading.Event()
 
@@ -749,20 +790,16 @@ class Theatre:
                 resp_future = self._stage.submit_request(
                     addr, request, delayed, interrupt=interrupt
                 )
-                self._sm.await_future(addr, request, resp_future, play)
+                return RequestResult.AwaitFuture(request, resp_future)
             case System.link(target=actor):
                 if actor not in play.states:
-                    self._sm.resume_with_error(
-                        addr, DestinationNotFound(actor), play, self._stage
-                    )
+                    return RequestResult.ResumeWithError(DestinationNotFound(actor))
                 else:
                     self._link(addr, actor, play)
-                    self._sm.resume_with_value(addr, None, play, self._stage)
+                    return RequestResult.ResumeWithValue(None)
             case _:
                 self._logger.debug(f"unexpected request {request}")
-                self._sm.resume_with_error(
-                    addr, UnsupportedRequest(addr, request), play, self._stage
-                )
+                return RequestResult.ResumeWithError(UnsupportedRequest(addr, request))
 
     def _handle_external_request(self, request, result_future: Future, play: Play):
         try:
@@ -772,7 +809,12 @@ class Theatre:
                     result_future.set_result(address)
                     self._sm.chain(address, play, self._stage, self._handle_request)
                 case System.send(address, message):
-                    self._send(address, message, result_future, play)
+                    try:
+                        self._send(address, message, play)
+                    except Exception as ex:
+                        result_future.set_exception(ex)
+                    else:
+                        result_future.set_result(None)
                 case _:
                     result_future.set_exception(NotImplementedError(request))
         except Exception as ex:
