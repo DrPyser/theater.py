@@ -1025,8 +1025,12 @@ class Theatre:
         self._sm.initiate(sheet.address, play, self._stage)
         return sheet.address
 
+    def _create_task(self):
+        fut = Future()
+        return fut 
+
     def _request(self, request):
-        future = Future()
+        future = self._create_task()
         self._events.put(Event.ExternalRequest(request=request, result_future=future))
         return future
 
@@ -1055,7 +1059,7 @@ class Theatre:
 
     def wait_ensemble(self):
         # wait for all actors to terminate
-        future = Future()
+        future = self._create_task()
         self._events.put(
             Event.RegisterCondition(
                 predicate=lambda play: all(
@@ -1072,7 +1076,7 @@ class Theatre:
 
     def spotlight(self, actor: ActorAddress):
         # wait for a specific actor to terminate
-        future = Future()
+        future = self._create_task()
         self._events.put(
             Event.RegisterCondition(
                 predicate=lambda play: (
@@ -1092,7 +1096,7 @@ class Theatre:
                 raise ActorSignaled(actor, signal)
 
     def census(self):
-        future = Future()
+        future = self._create_task()
         self._events.put(
             Event.RegisterCondition(
                 predicate=lambda play: True,
@@ -1130,6 +1134,7 @@ class Theatre:
             self._stop()
             self._logger.debug("Joining on run loop thread")
             self._thread.join()
+
         # cancel pending tasks if exception is raised
         # else gracefully complete remaining tasks
         self._logger.debug(
