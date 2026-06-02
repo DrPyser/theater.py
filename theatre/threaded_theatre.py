@@ -762,15 +762,20 @@ class Theatre:
                 )
 
     def _handle_external_request(self, request, result_future: Future, play: Play):
-        match request:
-            case System.spawn(script, props):
-                address = self._spawn(script=script, props=props)
-                result_future.set_result(address)
-                self._sm.chain(address, play, self._stage, self._handle_request)
-            case System.send(address, message):
-                self._send(address, message, result_future, play)
-            case _:
-                result_future.set_exception(NotImplementedError(request))
+        try:
+            match request:
+                case System.spawn(script, props):
+                    address = self._spawn(script=script, props=props)
+                    result_future.set_result(address)
+                    self._sm.chain(address, play, self._stage, self._handle_request)
+                case System.send(address, message):
+                    self._send(address, message, result_future, play)
+                case _:
+                    result_future.set_exception(NotImplementedError(request))
+        except Exception as ex:
+            if not result_future.done():
+                result_future.set_exception(ex)
+            raise
 
     def _handle_event(self, event: Event, play: Play) -> None:
         self._logger.debug(f"Handling event {event=}")
@@ -907,24 +912,25 @@ class Theatre:
                 self._logger.debug(
                     f"Exception from condition predicate {condition.predicate=}: {ex}"
                 )
+                condition.future.set_exception(ex)
                 continue
         for condition in triggered_conditions:
             play.conditions.remove(condition)
 
     def _run_loop(self):
+        stop_reason = None
+        loop_count = itertools.count()
+        idle_count = 0
+        events = []
         try:
             assert self._play
 
-            loop_count = itertools.count()
-            idle_count = 0
-            stop = False
-            stop_idle = False
-            while not stop:
+            while not stop_reason:
                 if self.max_idle and idle_count >= self.max_idle:
                     self._logger.debug(
                         f"Reached max idle count ({self.max_idle=}), stopping"
                     )
-                    stop_idle = True
+                    stop_reason = "idle"
                     break
                 cnt = next(loop_count)
                 self._logger.debug(f"Running main loop ({cnt})")
@@ -948,32 +954,53 @@ class Theatre:
 
                 self._logger.debug(f"{len(events)} events to handle")
                 for event in events:
-                    try:
-                        self._handle_event(event, self._play)
-                    except Event.Stop:
-                        self._logger.debug(
-                            f"({loop_count}) Stop exception raised, terminating event loop"
-                        )
-                        stop = True
-                        break
+                    self._handle_event(event, self._play)
                     self._logger.debug(f"Handled event {event}")
 
                 self._process_conditions(self._play)
-
-            self._logger.info(f"Terminating play: {stop=} {idle_count=}")
-            for condition in self._play.conditions:
-                if stop_idle:
+        except Event.Stop as ex:
+            self._logger.info(
+                f"({loop_count}) Stop signal received, terminating event loop: %s",
+                ex
+            )
+            stop_reason = ("signal", ex)
+        except BaseException as ex:
+            self._logger.exception("(%d) Theatre run loop raised exception: %s", loop_count, ex)
+            stop_reason = ("error", ex)
+            raise
+        finally:
+            self._logger.info(f"Terminating play: {stop_reason=} {idle_count=}")
+            match stop_reason:
+                case "idle":
                     assert self.max_idle and idle_count >= self.max_idle
-                    condition.future.set_exception(
+                    exception = (
                         MaxIdleException(idle_count, self.max_idle)
                     )
-                elif stop:
-                    condition.future.set_exception(Event.Stop())
-                else:
-                    condition.future.set_exception(Exception("dunny why stop"))
-        except BaseException as ex:
-            self._logger.exception("Theatre run loop raised exception: %s", ex)
-            raise
+                case ("signal", event):
+                    exception = event
+                case ("error", error):
+                    exception = error
+                case _:
+                    exception = Exception(f"dunny why stop: {stop_reason}")
+
+            # make sure pending future-bearing events are resolved
+            events += list(drain(self._events, timeout=0.0))
+            for event in events:
+                match event:
+                    case Event.RegisterCondition(future=fut) \
+                        | Event.ExternalRequest(result_future=fut) \
+                        if not fut.done():
+                        self._logger.debug("Aborting future for event: %s", event)
+                        fut.set_exception(exception)
+                    case _:
+                        continue
+                        
+            self._logger.debug("Aborting %d registered conditions", len(self._play.conditions))
+            for condition in self._play.conditions:
+                if not condition.future.done():
+                    condition.future.set_exception(
+                        exception
+                    )
 
     def _stop(self):
         assert self._thread and self._thread.is_alive()
