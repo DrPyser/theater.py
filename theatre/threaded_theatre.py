@@ -157,8 +157,9 @@ class Event:
         result_future: Future
 
     class Stop(Exception):
-        def __init__(self):
-            super().__init__("Stopping play")
+        def __init__(self, reason: str):
+            super().__init__(f"Stopping: {reason}")
+            self.reason = reason
 
     @dataclass
     class RegisterCondition:
@@ -976,7 +977,7 @@ class Theatre:
 
     def _stop(self):
         assert self._thread and self._thread.is_alive()
-        self._events.put(Event.Stop())
+        self._events.put(Event.Stop("externally requested"))
 
     def _start(self):
         self._play = Play(states={}, actors={})
