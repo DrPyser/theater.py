@@ -382,11 +382,6 @@ class StateMachine:
         self.cancel_pending_task(addr, play)
         play.states[addr] = State.Terminated(cause=cause)
 
-    def resolve(self, addr, request, value, play):
-        resp_future = Future()
-        resp_future.set_result(value)
-        play.states[addr] = State.Awaiting(request=request, response_future=resp_future)
-
     def await_future(self, addr, request, future, play):
         assert isinstance(play.states[addr], State.Waiting)
         play.states[addr] = State.Awaiting(request=request, response_future=future)
@@ -558,7 +553,7 @@ class StateMachine:
             logger.debug(f"Transitioned actor {addr}: {state} -> {play.states[addr]}")
             state = play.states[addr]
 
-    def deliver_message(self, addr, play):
+    def deliver_message(self, addr, play, stage):
         """Try to satisfy a Receiving actor with a mailbox message.
         Returns True if a message was delivered and state transitioned."""
         if addr not in play.states:
@@ -581,7 +576,7 @@ class StateMachine:
                     logger.debug(f"actor({addr}) request({request}) satisfied: {msg}")
                     if tfut:
                         tfut.cancel()
-                    self.resolve(addr, request, msg, play)
+                    self.resume_with_value(addr, msg, play, stage)
                     return True
             case _:
                 return False
@@ -875,7 +870,7 @@ class Theatre:
                 self._logger.debug(
                     f"actor({actor}) mailbox now has {len(play.actors[actor].mailbox)} messages"
                 )
-                if self._sm.deliver_message(actor, play):
+                if self._sm.deliver_message(actor, play, self._stage):
                     self._sm.chain(actor, play, self._stage, self._handle_request)
             case Event.RegisterCondition():
                 self._play.conditions.append(event)
