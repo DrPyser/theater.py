@@ -77,9 +77,7 @@ class ActorAddress(Address, tuple):
 class State:
     @dataclass(frozen=True)
     class Init:
-        """Actor initializing - executing code before first yield"""
-
-        future: CancellableTask
+        """Actor freshly minted"""
 
     @dataclass(frozen=True)
     class Waiting:
@@ -370,8 +368,7 @@ class StateMachine:
                 if tfut:
                     tfut.cancel()
             case (
-                State.Init(future)
-                | State.Awaiting(response_future=future)
+                State.Awaiting(response_future=future)
                 | State.Executing(future)
             ):
                 future.cancel()
@@ -393,15 +390,16 @@ class StateMachine:
     def initiate(self, addr, play, stage):
         assert addr not in play.states
         sheet = play.actors[addr]
-        future = stage.submit_performance(addr, sheet.performance.send, None)
-        play.states[addr] = State.Init(future=future)
+        play.states[addr] = State.Init()
 
     def resume_with_value(self, addr, value, play, stage):
+        assert not isinstance(play.states[addr], State.Executing)
         sheet = play.actors[addr]
         future = stage.submit_performance(addr, sheet.performance.send, value)
         play.states[addr] = State.Executing(future=future)
 
     def resume_with_error(self, addr, exc, play, stage):
+        assert not isinstance(play.states[addr], State.Executing)
         sheet = play.actors[addr]
         future = stage.submit_performance(addr, sheet.performance.throw, exc)
         play.states[addr] = State.Executing(future=future)
@@ -410,7 +408,7 @@ class StateMachine:
         state = play.states[addr]
         sheet = play.actors[addr]
         match state:
-            case State.Init(future=fut) | State.Executing(future=fut):
+            case State.Executing(future=fut):
                 if fut.cancel():
                     exec_future = stage.submit_performance(
                         addr, sheet.performance.throw, exc
@@ -441,25 +439,8 @@ class StateMachine:
         sheet = play.actors[addr]
 
         match state:
-            case State.Init(future) if future.done():
-                try:
-                    req = future.result()
-                except StopIteration as ex:
-                    play.states[addr] = State.Terminated(cause=NormalExit(ex.value))
-                    logger.debug(
-                        f"actor {addr} terminated during init with value {ex.value}"
-                    )
-                except CancelledError as ex:
-                    logger.debug(f"actor {addr} cancelled during init")
-                    wrap = ActorCancelled(addr)
-                    wrap.__cause__ = wrap.__context__ = ex
-                    play.states[addr] = State.Terminated(cause=ErrorExit(wrap))
-                except Exception as ex:
-                    play.states[addr] = State.Terminated(cause=ErrorExit(ex))
-                    logger.debug(f"actor {addr} died during init: {ex}")
-                else:
-                    play.states[addr] = State.Waiting(request=req)
-                    logger.debug(f"actor {addr} initialized, pending request {req}")
+            case State.Init():
+                self.resume_with_value(addr, None, play, stage)
                 return True
 
             case State.Waiting(request=req):
@@ -505,6 +486,11 @@ class StateMachine:
                 except StopIteration as ex:
                     play.states[addr] = State.Terminated(cause=NormalExit(ex.value))
                     logger.debug(f"actor {addr} terminated with value {ex.value}")
+                except CancelledError as ex:
+                    logger.debug(f"actor {addr} cancelled during init")
+                    wrap = ActorCancelled(addr)
+                    wrap.__cause__ = wrap.__context__ = ex
+                    play.states[addr] = State.Terminated(cause=ErrorExit(wrap))
                 except Exception as ex:
                     play.states[addr] = State.Terminated(cause=ErrorExit(ex))
                     logger.debug(f"actor {addr} died: {ex}")
@@ -672,7 +658,7 @@ class Theatre:
 
     def _send(self, address: ActorAddress, message: Any, play: Play):
         if destination := play.actors.get(address):
-            match play.states[address]:
+            match play.states.get(address):
                 case State.Terminated(cause=cause):
                     raise ActorTerminated(address, cause)
                 case _:
@@ -787,7 +773,7 @@ class Theatre:
                 )
                 return RequestResult.AwaitFuture(request, resp_future)
             case System.link(target=actor):
-                if actor not in play.states:
+                if actor not in play.actors:
                     return RequestResult.ResumeWithError(DestinationNotFound(actor))
                 else:
                     self._link(addr, actor, play)
@@ -802,7 +788,6 @@ class Theatre:
                 case System.spawn(script, props):
                     address = self._spawn(script=script, props=props)
                     result_future.set_result(address)
-                    self._sm.chain(address, play, self._stage, self._handle_request)
                 case System.send(address, message):
                     try:
                         self._send(address, message, play)
@@ -832,7 +817,7 @@ class Theatre:
                     return
                 actor_state = play.states[actor]
                 match actor_state:
-                    case State.Executing(future=fut) | State.Init(future=fut):
+                    case State.Executing(future=fut):
                         assert future.done()
                         if future is not fut:
                             self._logger.debug(
@@ -999,6 +984,11 @@ class Theatre:
                     self._handle_event(event, self._play)
                     self._logger.debug(f"Handled event {event}")
 
+                # now check for new actors ready to act
+                for newbie in tuple(actor for actor in self._play.actors if actor not in self._play.states):
+                    self._logger.debug("(%d) Kicking-off new actor %s", cnt, newbie)
+                    self._sm.initiate(newbie, self._play, self._stage)
+                    self._sm.chain(newbie, self._play, self._stage, self._handle_request)
                 self._process_conditions(self._play)
         except Event.Stop as ex:
             self._logger.info(
@@ -1062,7 +1052,6 @@ class Theatre:
         play = play or self._play
         sheet = self._create_actor(script, props)
         play.actors[sheet.address] = sheet
-        self._sm.initiate(sheet.address, play, self._stage)
         return sheet.address
 
     def _create_task(self):
