@@ -340,10 +340,11 @@ class Stage:
             f"submitting performance for actor {addr}: {fn.__qualname__}{args!r}"
         )
         fut = self.executor.submit(fn, *args)
+        task = CancellableTask(future=fut, interrupt=interrupt)
         fut.add_done_callback(
-            lambda f: self.events.put(Event.EndOfScene(actor=addr, future=f))
+            lambda f: self.events.put(Event.EndOfScene(actor=addr, future=task))
         )
-        return CancellableTask(future=fut, interrupt=interrupt)
+        return task
 
     def submit_request(self, addr, request, fn, *args, interrupt=None):
         self.logger.debug(
