@@ -327,6 +327,7 @@ class Play:
     states: dict[ActorAddress, ActorState]
     actors: dict[ActorAddress, ActorSheet]
     conditions: list[Event.RegisterCondition] = field(default_factory=list)
+    runnable: deque[ActorAddress] = field(default_factory=deque)
 
 
 @dataclass
@@ -407,6 +408,7 @@ class StateMachine:
 
     def interrupt(self, addr, exc, play, stage):
         state = play.states[addr]
+        stage.logger.debug("interrupting actor(%s) in state %s", addr, state)
         sheet = play.actors[addr]
         match state:
             case State.Executing(future=fut):
@@ -434,9 +436,11 @@ class StateMachine:
                     play.states[addr] = State.Executing(future=exec_future)
 
     def process(self, addr, play, stage, request_handler) -> bool:
+        stage.logger.debug("processing state of actor(%s)", addr)
         if addr not in play.states:
             return False
         state = play.states[addr]
+        stage.logger.debug("actor(%s) in state %s", addr, state)
         sheet = play.actors[addr]
 
         match state:
@@ -505,9 +509,6 @@ class StateMachine:
                 return False
 
             case State.Receiving(request=request, timeout_task=tfut):
-                logger.debug(
-                    f"actor ({addr}) still in Receiving state for request {request=}"
-                )
                 assert not tfut or not tfut.cancelled(), (
                     "Receiving state should not be observed with cancelled timeout"
                 )
@@ -515,7 +516,10 @@ class StateMachine:
                     logger.debug(
                         f"actor({addr}): Receiving state observed with completed timeout task"
                     )
-                    pass
+                    return False
+                if self._try_receive(addr, play, stage):
+                    return True
+
                 return False
 
             case State.Terminated(cause=cause):
@@ -528,25 +532,8 @@ class StateMachine:
                         logger.debug(f"actor({addr}) terminated with signal {cause}")
                 return False
 
-    def chain(self, addr, play, stage, request_handler):
-        logger.debug(f"Chaining transitions for actor {addr}")
-        state = play.states[addr]
-        while self.process(addr, play, stage, request_handler):
-            if addr not in play.states:
-                logger.debug(
-                    f"State of actor {addr} disappeared during transition from state {state}"
-                )
-                break
-            logger.debug(f"Transitioned actor {addr}: {state} -> {play.states[addr]}")
-            state = play.states[addr]
-
-    def deliver_message(self, addr, play, stage):
-        """Try to satisfy a Receiving actor with a mailbox message.
-        Returns True if a message was delivered and state transitioned."""
-        if addr not in play.states:
-            return False
-        actor_state = play.states[addr]
-        match actor_state:
+    def _try_receive(self, addr, play, stage):
+        match play.states[addr]:
             case State.Receiving(request=request, timeout_task=tfut):
                 if tfut and tfut.done():
                     return False
@@ -565,8 +552,8 @@ class StateMachine:
                         tfut.cancel()
                     self.resume_with_value(addr, msg, play, stage)
                     return True
-            case _:
-                return False
+            case state:
+                raise RuntimeError(f"tried receiving from non-Receiving state {state}")
 
 
 @dataclass(frozen=True)
@@ -828,7 +815,8 @@ class Theatre:
                             self._logger.debug(
                                 f"Stale event: actor {actor} state has different future {fut}"
                             )
-                        self._sm.chain(actor, play, self._stage, self._handle_request)
+                        else:
+                            play.runnable.append(actor)
                         return
                     case State.Receiving():
                         # already transitioned to Receiving state from receive request
@@ -850,7 +838,7 @@ class Theatre:
                             self._logger.debug(
                                 f"Stale event: actor {actor} state has different future {fut}"
                             )
-                        self._sm.chain(actor, play, self._stage, self._handle_request)
+                        play.runnable.append(actor)
                     case state:
                         self._logger.debug(
                             f"Stale event: actor {actor} has unexpected state {state}"
@@ -860,21 +848,20 @@ class Theatre:
                 self._logger.debug(
                     f"actor({actor}) mailbox now has {len(play.actors[actor].mailbox)} messages"
                 )
-                if self._sm.deliver_message(actor, play, self._stage):
-                    self._sm.chain(actor, play, self._stage, self._handle_request)
+                play.runnable.append(actor)
             case Event.RegisterCondition():
-                self._play.conditions.append(event)
+                play.conditions.append(event)
             case Event.ExternalRequest(request, result_future):
                 self._handle_external_request(request, result_future, play)
             case Event.Signal(actor, signal):
                 if not isinstance(play.states[actor], State.Terminated):
                     self._handle_signal(actor, signal, play)
-                    self._sm.chain(actor, play, self._stage, self._handle_request)
+                    play.runnable.append(actor)
             case Event.SignalAll(signal):
                 for actor in play.actors:
                     if not isinstance(play.states[actor], State.Terminated):
                         self._handle_signal(actor, signal, play)
-                        self._sm.chain(actor, play, self._stage, self._handle_request)
+                        play.runnable.append(actor)
             case Event.LinkTrap(linker, linked, future):
                 linker_state = play.states[linker]
                 self._logger.debug(
@@ -890,7 +877,7 @@ class Theatre:
                         self._sm.interrupt(
                             linker, ActorTerminated(linked, cause), play, self._stage
                         )
-                self._sm.chain(linker, play, self._stage, self._handle_request)
+                        play.runnable.append(linker)
             case Event.ReceiveTimeout(
                 actor=actor, request=request, timeout_task=future
             ):
@@ -910,11 +897,11 @@ class Theatre:
                         self._sm.interrupt(
                             actor, ReceiveTimeout(request=req), play, self._stage
                         )
+                        play.runnable.append(actor)
                     case _:
                         self._logger.debug(
                             f"actor({actor}): ignoring stale receive timeout while actor in state {state}"
                         )
-                self._sm.chain(actor, play, self._stage, self._handle_request)
             case _:
                 self._logger.debug(f"Unknown event {event=}")
 
@@ -993,7 +980,16 @@ class Theatre:
                 for newbie in tuple(actor for actor in self._play.actors if actor not in self._play.states):
                     self._logger.debug("(%d) Kicking-off new actor %s", cnt, newbie)
                     self._sm.initiate(newbie, self._play, self._stage)
-                    self._sm.chain(newbie, self._play, self._stage, self._handle_request)
+                    self._play.runnable.append(newbie)
+
+                # let actors play
+                while self._play.runnable:
+                    self._logger.debug("(%d) %d actors in runnable state", cnt, len(self._play.runnable))
+                    addr = self._play.runnable.popleft()
+                    if addr in self._play.states:
+                        if self._sm.process(addr, self._play, self._stage, self._handle_request):
+                            self._play.runnable.append(addr)
+
                 self._process_conditions(self._play)
         except Event.Stop as ex:
             self._logger.info(
