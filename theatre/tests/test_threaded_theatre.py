@@ -47,7 +47,7 @@ def test_theatre_run():
         print(f"Received args {args}")
         yield System.exit()
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         theatre.run(main_actor)
 
 
@@ -56,7 +56,7 @@ def test_theatre_run_get_self():
         me = yield System.whoami()
         return me
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         result = theatre.run(main_actor)
         assert result is not None
 
@@ -68,7 +68,7 @@ def test_theatre_run_actor_self_send():
         msg = yield System.receive()
         assert msg == "Hello"
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         theatre.run(main_actor)
 
 
@@ -86,7 +86,7 @@ def test_theatre_run_actor_spawn():
         msg = yield System.receive()
         assert msg == "mom"
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         theatre.run(main_actor)
 
 
@@ -101,7 +101,7 @@ def test_theatre_run_actor_unsupported_request():
         with pytest.raises(UnsupportedRequest):
             yield strange_request()
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         theatre.run(main_actor)
 
 
@@ -121,7 +121,7 @@ def test_theatre_run_actor_terminated():
         assert msg == "sub_received:test"
         yield System.exit("main_success")
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         result = theatre.run(main_actor)
         assert result == "main_success"
 
@@ -130,7 +130,7 @@ def test_theatre_run_actor_terminated_with_value():
     def simple_actor(*args):
         yield System.exit(42)
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         result = theatre.run(simple_actor)
         assert result == 42
 
@@ -141,7 +141,7 @@ def test_theatre_run_actor_terminated_with_error():
         raise Exception("Forgot my lines")
         yield System.exit()
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         with pytest.raises(Exception) as ex:
             theatre.run(failing_actor)
         assert ex.value.args == ("Forgot my lines",)
@@ -158,7 +158,7 @@ def test_theatre_run_multiple_actors_terminated():
         w2 = yield System.spawn(worker, ("w2",))
         yield System.exit("all_done")
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         result = theatre.run(main_actor)
         assert result == "all_done"
 
@@ -172,7 +172,7 @@ def test_send_to_terminated_actor_raises():
         yield System.sleep(0.005)
         yield System.send(doomed, "test")
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         with pytest.raises(ActorTerminated) as exc:
             result = theatre.run(sender)
 
@@ -190,7 +190,7 @@ def test_send_to_terminated_actor_caught():
             pass
         yield System.exit("sender_success")
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         result = theatre.run(sender)
         assert result == "sender_success"
 
@@ -200,7 +200,7 @@ def test_run_actor_dies_during_init():
         raise Exception()
         yield System.exit("sender_success")
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         with pytest.raises(Exception):
             result = theatre.run(protagonist)
 
@@ -210,7 +210,7 @@ def test_run_actor_returns_during_init():
         return 0
         yield System.exit("sender_success")
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         result = theatre.run(protagonist)
         assert result == 0
 
@@ -239,7 +239,7 @@ def test_cancelled_request():
         except ActorCancelled as e:
             yield System.exit("cancelled_ok")
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         addr = theatre.spawn(main_actor)
         theatre.cancel(addr)
         result = theatre.spotlight(addr)
@@ -259,7 +259,7 @@ def test_non_blocking_receive():
         yield System.send(w2, "world")
         yield System.exit("done")
 
-    with curtain_call(executor=ThreadPoolExecutor(max_workers=1)) as theatre:
+    with curtain_call(max_idle=1, executor=ThreadPoolExecutor(max_workers=1)) as theatre:
         result = theatre.run(sender)
         assert result == "done"
 
@@ -272,7 +272,7 @@ def test_theatre_spawn_and_spotlight():
     def replier(address):
         yield System.send(address, "hello")
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         waiter_address = theatre.spawn(waiter)
         theatre.spawn(replier, waiter_address)
         result = theatre.spotlight(waiter_address)
@@ -288,7 +288,7 @@ def test_theatre_wait_ensemble():
         for addr in addresses:
             yield System.send(addr, f"hello {addr}")
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         waiters = []
         for i in range(10):
             waiter_address = theatre.spawn(waiter)
@@ -321,7 +321,7 @@ def test_selective_receive():
         assert remaining2 == "ping"
         yield System.exit("ok")
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         result = theatre.run(main_actor)
         assert result == "ok"
 
@@ -340,7 +340,7 @@ def test_selective_receive_no_match_parks():
         assert msg == "noise"
         yield System.exit("done")
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         result = theatre.run(main_actor)
         assert result == "done"
 
@@ -359,7 +359,7 @@ def test_mailbox_full_in_send_raises():
         yield System.receive(filter=lambda msg: msg == "z")
         yield System.exit("done")
 
-    with curtain_call(queue_size=2) as theatre:
+    with curtain_call(max_idle=1, queue_size=2) as theatre:
         result = theatre.run(sender)
         assert result == "caught"
 
@@ -369,7 +369,7 @@ def test_sigkill():
         yield System.receive(filter=lambda msg: False)
         yield System.exit("done")
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         addr = theatre.spawn(blocker)
         theatre.kill(addr)
         with pytest.raises(ActorSignaled) as exc:
@@ -392,7 +392,7 @@ def test_link_trap_while_receive():
             assert ex.actor == addr
             assert ex.cause == NormalExit("done")
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         theatre.run(linker)
 
 
@@ -411,7 +411,7 @@ def test_link_trap_while_sleeping():
             assert ex.actor == addr
             assert ex.cause == NormalExit("done")
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         theatre.run(linker)
 
 
@@ -425,7 +425,7 @@ def test_link_trap_after_termination():
         yield System.link(addr)
         yield System.send(addr, "hello")
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         theatre.run(linker)
 
 
@@ -443,7 +443,7 @@ def test_spawn_link_trap_while_receiving():
             assert ex.actor == addr
             assert ex.cause == NormalExit("done")
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         theatre.run(linker)
 
 
@@ -453,7 +453,7 @@ def test_fire_in_theatre_while_receive():
             msg = yield System.receive()
 
     with pytest.raises(Exception):
-        with curtain_call() as theatre:
+        with curtain_call(max_idle=1) as theatre:
             theatre.spawn(actor)
             raise Exception()
     assert threading.active_count() == 1
@@ -465,7 +465,7 @@ def test_fire_in_theatre_while_sleep():
             msg = yield System.sleep(5)
 
     with pytest.raises(Exception):
-        with curtain_call() as theatre:
+        with curtain_call(max_idle=1) as theatre:
             theatre.spawn(actor)
             raise Exception()
     assert threading.active_count() == 1
@@ -482,7 +482,7 @@ def test_receive_with_timeout():
                 print(f"{t2} - {t} = {t2 - t}")
                 return ex
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         result = theatre.run(actor)
         assert isinstance(result, ReceiveTimeout)
     assert threading.active_count() == 1
@@ -495,7 +495,7 @@ def test_sleep_interrupted_by_sigint():
         except ActorCancelled:
             yield System.exit("interrupted")
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         addr = theatre.spawn(sleeper)
         time.sleep(0.05)
         theatre.cancel(addr)
@@ -507,7 +507,7 @@ def test_sleep_interrupted_by_sigkill():
     def sleeper(*args):
         yield System.sleep(60)
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         addr = theatre.spawn(sleeper)
         time.sleep(0.05)
         theatre.kill(addr)
@@ -525,7 +525,7 @@ def test_signal_all_interrupts_sleep():
         except ActorCancelled:
             yield System.exit("interrupted")
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         addrs = [theatre.spawn(sleeper) for _ in range(N)]
         time.sleep(0.05)
         theatre.signal_all(Signal.INT)
@@ -543,7 +543,7 @@ def test_receive_timeout_interrupted_by_sigint():
         except ActorCancelled:
             yield System.exit("cancelled")
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         addr = theatre.spawn(actor)
         time.sleep(0.05)
         theatre.cancel(addr)
@@ -555,7 +555,7 @@ def test_sigint_on_terminated_actor_is_noop():
     def actor(*args):
         yield System.exit("done")
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         addr = theatre.spawn(actor)
         result = theatre.spotlight(addr)
         assert result == "done"
@@ -572,7 +572,7 @@ def test_receive_timeout_cancelled_on_message():
     def sender(target, *args):
         yield System.send(target, "hello")
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         recv = theatre.spawn(receiver)
         theatre.spawn(sender, recv)
         result = theatre.spotlight(recv)
@@ -587,7 +587,7 @@ def test_receive_timeout_with_filter_matches_before_timeout():
     def sender(target, *args):
         yield System.send(target, "hello")
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         recv = theatre.spawn(receiver)
         theatre.spawn(sender, recv)
         result = theatre.spotlight(recv)
@@ -601,7 +601,7 @@ def test_receive_timeout_with_filter_no_match_expires():
         except ReceiveTimeout as ex:
             return ex
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         result = theatre.run(actor)
         assert isinstance(result, ReceiveTimeout)
     assert threading.active_count() == 1
@@ -616,7 +616,7 @@ def test_stale_receive_timeout_ignored():
     def sender(target, *args):
         yield System.send(target, "hello")
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         recv = theatre.spawn(receiver)
         theatre.spawn(sender, recv)
         result = theatre.spotlight(recv)
@@ -644,7 +644,7 @@ def test_census_returns_actor_infos():
     def simple(*args):
         yield System.exit(42)
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         addr = theatre.spawn(simple)
         time.sleep(0.05)
         infos = theatre.census()
@@ -660,7 +660,7 @@ def test_census_multiple_actors():
         yield System.receive()
         yield System.exit(name)
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         a1 = theatre.spawn(worker, "a")
         a2 = theatre.spawn(worker, "b")
         theatre.send(a1, "go")
@@ -677,7 +677,7 @@ def test_census_frozen():
     def simple(*args):
         yield System.exit(42)
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         theatre.spawn(simple)
         time.sleep(0.05)
         infos = theatre.census()
@@ -691,7 +691,7 @@ def test_census_live_actor_has_correct_state():
         msg = yield System.receive()
         yield System.exit(msg)
 
-    with curtain_call() as theatre:
+    with curtain_call(max_idle=1) as theatre:
         addr = theatre.spawn(waiter)
         time.sleep(0.05)
         infos = theatre.census()
@@ -699,3 +699,4 @@ def test_census_live_actor_has_correct_state():
         assert info.state_name == "Receiving"
         assert info.mailbox_size == 0
         assert info.exit_cause is None
+
