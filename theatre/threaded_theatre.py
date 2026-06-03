@@ -694,6 +694,51 @@ class Theatre:
             case _:
                 raise NotImplementedError()
 
+    def _receive(self, actor: ActorSheet, request: System.receive, play: Play):
+        addr = actor.address
+        try:
+            msg = actor.mailbox.pop_matching(request.filter)
+        except _NoMatch:
+            self._logger.debug(
+                f"Parking actor({addr}) on receive request ({request})"
+            )
+            timeout_task = None
+            if request.timeout is not None:
+                self._logger.debug(
+                    f"actor({addr}): Scheduling timeout for receive request in {request.timeout}s"
+                )
+                interrupt = threading.Event()
+
+                def delayed():
+                    if interrupt.wait(timeout=request.timeout):
+                        return
+                    else:
+                        raise ReceiveTimeout(request)
+
+                fut = self._stage.executor.submit(delayed)
+                timeout_task = CancellableTask(future=fut, interrupt=interrupt)
+
+                def timeout_callback(f):
+                    self._logger.debug(
+                        f"Receive timeout triggered ({f.cancelled()=},{f.exception()=})"
+                    )
+                    if not (interrupt.is_set() or f.cancelled()):
+                        self._events.put(
+                            Event.ReceiveTimeout(
+                                actor=addr,
+                                request=request,
+                                timeout_task=timeout_task,
+                            )
+                        )
+
+                fut.add_done_callback(timeout_callback)
+            return RequestResult.Park(request, timeout_task)
+        else:
+            self._logger.debug(
+                f"actor({addr}) request {request} satisfied directly: {msg}"
+            )
+            return RequestResult.ResumeWithValue(msg)
+            
     def _handle_request(self, addr, request, play: Play):
         self._logger.debug(f"handling request: actor({addr}), request({request})")
         sheet = play.actors[addr]
@@ -719,48 +764,7 @@ class Theatre:
                 else:
                     return RequestResult.ResumeWithValue(None)
             case System.receive(filter=filter_fn, timeout=timeout):
-                try:
-                    msg = sheet.mailbox.pop_matching(filter_fn)
-                except _NoMatch:
-                    self._logger.debug(
-                        f"Parking actor({addr}) on receive request ({request})"
-                    )
-                    timeout_task = None
-                    if timeout is not None:
-                        self._logger.debug(
-                            f"actor({addr}): Scheduling timeout for receive request in {timeout}s"
-                        )
-                        interrupt = threading.Event()
-
-                        def delayed():
-                            if interrupt.wait(timeout=timeout):
-                                return
-                            else:
-                                raise ReceiveTimeout(request)
-
-                        fut = self._stage.executor.submit(delayed)
-                        timeout_task = CancellableTask(future=fut, interrupt=interrupt)
-
-                        def timeout_callback(f):
-                            self._logger.debug(
-                                f"Receive timeout triggered ({f.cancelled()=},{f.exception()=})"
-                            )
-                            if not (interrupt.is_set() or f.cancelled()):
-                                self._events.put(
-                                    Event.ReceiveTimeout(
-                                        actor=addr,
-                                        request=request,
-                                        timeout_task=timeout_task,
-                                    )
-                                )
-
-                        fut.add_done_callback(timeout_callback)
-                    return RequestResult.Park(request, timeout_task)
-                else:
-                    self._logger.debug(
-                        f"actor({addr}) request {request} satisfied directly: {msg}"
-                    )
-                    return RequestResult.ResumeWithValue(msg)
+                return self._receive(sheet, request, play)
             case System.sleep(n):
                 interrupt = threading.Event()
 
