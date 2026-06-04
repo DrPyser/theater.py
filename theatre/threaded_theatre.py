@@ -412,21 +412,13 @@ class StateMachine:
         sheet = play.actors[addr]
         match state:
             case State.Executing(future=fut):
-                if fut.cancel():
-                    exec_future = stage.submit_performance(
-                        addr, sheet.performance.throw, exc
-                    )
-                    play.states[addr] = State.Executing(future=exec_future)
-                else:
-                    # the future was *not* cancelled, so we need to chain on its completion
-                    # to signal the interruption on the next opportunity
-                    def exec_chain():
-                        result = fut.result()
-                        stage.logger.debug("actor(%s): dismissing request %s to signal interruption", addr, result)
-                        sheet.performance.throw(exc)
+                def exec_chain():
+                    result = fut.result()
+                    stage.logger.debug("actor(%s): dismissing request %s to signal interruption", addr, result)
+                    sheet.performance.throw(exc)
 
-                    exec_future = stage.submit_performance(addr, exec_chain)
-                    play.states[addr] = State.Executing(future=exec_future)
+                exec_future = stage.submit_performance(addr, exec_chain)
+                play.states[addr] = State.Executing(future=exec_future)
             case _:
                 self.cancel_pending_task(addr, play)
                 if not isinstance(state, State.Terminated):
