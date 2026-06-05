@@ -434,7 +434,7 @@ class StateMachine:
                 def exec_chain():
                     result = fut.result()
                     stage.logger.debug("actor(%s): dismissing request %s to signal interruption", addr, result)
-                    sheet.performance.throw(exc)
+                    return sheet.performance.throw(exc)
 
                 exec_future = stage.submit_performance(addr, exec_chain)
                 play.states[addr] = State.Executing(future=exec_future)
