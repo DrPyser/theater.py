@@ -151,16 +151,16 @@ class Signal:
 
 
 class Event:
-    @dataclass
+    @dataclass(frozen=True)
     class ActorEvent:
         actor: ActorAddress
 
-    @dataclass
+    @dataclass(frozen=True)
     class RequestCompleted(ActorEvent):
         request: Any
         future: Future
 
-    @dataclass
+    @dataclass(frozen=True)
     class EndOfScene(ActorEvent):
         future: Future
 
@@ -169,7 +169,7 @@ class Event:
         message: Any
         sender: ActorAddress
 
-    @dataclass
+    @dataclass(frozen=True)
     class ExternalRequest:
         request: Any
         result_future: Future
@@ -179,28 +179,28 @@ class Event:
             super().__init__(f"Stopping: {reason}")
             self.reason = reason
 
-    @dataclass
+    @dataclass(frozen=True)
     class RegisterCondition:
         predicate: Callable[[Play], bool]
         projection: Callable[[Play], Any]
         future: Future
 
-    @dataclass
+    @dataclass(frozen=True)
     class Signal:
         actor: ActorAddress
         signal: Signal
 
-    @dataclass
+    @dataclass(frozen=True)
     class SignalAll:
         signal: Signal
 
-    @dataclass
+    @dataclass(frozen=True)
     class LinkTrap:
         linker: ActorAddress
         linked: ActorAddress
         future: Future
 
-    @dataclass
+    @dataclass(frozen=True)
     class ReceiveTimeout:
         actor: ActorAddress
         request: object
