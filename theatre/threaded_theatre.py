@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import enum
 import itertools
 import logging
 import os
@@ -121,11 +120,49 @@ ActorState = (
     | State.Terminated
 )
 
+@dataclass
+class NormalExit:
+    value: Any
 
-class Signal(enum.Enum):
-    KILL = enum.auto()
-    INT = enum.auto()
-    TERM = enum.auto()
+
+class ErrorExit(Exception):
+    __match_args__ = ("cause", "context")
+
+    def __init__(self, cause, context=None):
+        self.cause = cause
+        self.context = context
+
+
+Exit = NormalExit | ErrorExit
+
+
+class DestinationNotFound(Exception):
+    def __init__(self, destination: ActorAddress):
+        self.destination = destination
+
+
+class ActorCancelled(Exception):
+    def __init__(self, actor: ActorAddress):
+        self.actor = actor
+
+
+class ReceiveTimeout(Exception):
+    def __init__(self, request: object):
+        self.request = request
+
+
+class ActorSignaled(Exception):
+    def __init__(self, actor: ActorAddress, signal: Signal):
+        self.actor = actor
+        self.signal = signal
+
+
+class MailboxFull(Exception):
+    pass
+
+
+class _NoMatch(Exception):
+    pass
 
 
 class _Signal(Exception):
@@ -232,56 +269,6 @@ class RequestResult:
     @dataclass
     class ResumeWithError:
         exc: BaseException
-
-@dataclass
-class NormalExit:
-    value: Any
-
-
-class ErrorExit(Exception):
-    __match_args__ = ("cause", "context")
-
-    def __init__(self, cause, context=None):
-        self.cause = cause
-        self.context = context
-
-
-Exit = NormalExit | ErrorExit
-
-
-class DestinationNotFound(Exception):
-    def __init__(self, destination: ActorAddress):
-        self.destination = destination
-
-
-class ActorCancelled(Exception):
-    def __init__(self, actor: ActorAddress):
-        self.actor = actor
-
-
-class ActorTerminated(Exception):
-    def __init__(self, actor: ActorAddress, cause: Exit | Signal):
-        self.actor = actor
-        self.cause = cause
-
-
-class ReceiveTimeout(Exception):
-    def __init__(self, request: object):
-        self.request = request
-
-
-class ActorSignaled(Exception):
-    def __init__(self, actor: ActorAddress, signal: Signal):
-        self.actor = actor
-        self.signal = signal
-
-
-class MailboxFull(Exception):
-    pass
-
-
-class _NoMatch(Exception):
-    pass
 
 
 class Mailbox:
