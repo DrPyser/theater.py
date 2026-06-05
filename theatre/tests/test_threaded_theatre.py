@@ -1,27 +1,21 @@
 import dataclasses
-import time
-import pytest
+import queue
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
+
+import pytest
+
 from theatre.interfaces import System
 from theatre.threaded_theatre import (
-    Theatre,
-    ActorInfo,
-    DestinationNotFound,
-    curtain_call,
-    RequestCancelled,
-    ActorCancelled,
-    UnsupportedRequest,
-    ReceiveTimeout,
-    drain,
-    ErrorExit,
     NormalExit,
-    ActorTerminated,
-    MailboxFull,
+    ReceiveTimeout,
     Signal,
-    ActorSignaled,
+    Theatre,
+    UnsupportedRequest,
+    curtain_call,
+    drain,
 )
-import queue
 
 
 def test_drain_empty_queue():
@@ -173,7 +167,7 @@ def test_send_to_terminated_actor_raises():
         yield System.send(doomed, "test")
 
     with curtain_call(max_idle=1) as theatre:
-        with pytest.raises(ActorTerminated) as exc:
+        with pytest.raises(Signal.ActorTerminated) as exc:
             result = theatre.run(sender)
 
 
@@ -186,7 +180,7 @@ def test_send_to_terminated_actor_caught():
         yield System.sleep(0.001)
         try:
             yield System.send(doomed, "test")
-        except ActorTerminated:
+        except Signal.ActorTerminated:
             pass
         yield System.exit("sender_success")
 
@@ -227,7 +221,7 @@ def test_cancelled_init():
         yield System.whoami()
 
     with Theatre(mock_executor) as theatre:
-        with pytest.raises(ActorCancelled) as exc:
+        with pytest.raises(Signal.INT) as exc:
             theatre.run(main_actor)
 
 
@@ -236,7 +230,7 @@ def test_cancelled_request():
     def main_actor(*args):
         try:
             msg = yield System.receive()
-        except ActorCancelled as e:
+        except Signal.INT:
             yield System.exit("cancelled_ok")
 
     with curtain_call(max_idle=1) as theatre:
@@ -352,7 +346,8 @@ def test_mailbox_full_in_send_raises():
         yield System.send(doomed, "y")
         try:
             yield System.send(doomed, "overflow")
-        except MailboxFull:
+            yield System.receive()
+        except Signal.MailboxFull:
             yield System.exit("caught")
 
     def filler(*args):
@@ -372,9 +367,8 @@ def test_sigkill():
     with curtain_call(max_idle=1) as theatre:
         addr = theatre.spawn(blocker)
         theatre.kill(addr)
-        with pytest.raises(ActorSignaled) as exc:
+        with pytest.raises(Signal.KILL) as exc:
             theatre.spotlight(addr)
-        assert exc.value.signal is Signal.KILL
 
 
 def test_link_trap_while_receive():
@@ -388,7 +382,7 @@ def test_link_trap_while_receive():
         yield System.send(addr, "hello")
         try:
             yield System.receive()
-        except ActorTerminated as ex:
+        except Signal.ActorTerminated as ex:
             assert ex.actor == addr
             assert ex.cause == NormalExit("done")
 
@@ -407,7 +401,7 @@ def test_link_trap_while_sleeping():
         yield System.send(addr, "hello")
         try:
             yield System.sleep(5)
-        except ActorTerminated as ex:
+        except Signal.ActorTerminated as ex:
             assert ex.actor == addr
             assert ex.cause == NormalExit("done")
 
@@ -431,7 +425,8 @@ def test_link_trap_after_termination():
 
 def test_spawn_link_trap_while_receiving():
     def link_target(*args):
-        yield System.receive()
+        msg = yield System.receive()
+        print(f"Received message: {msg}")
         yield System.exit("done")
 
     def linker(*args):
@@ -439,7 +434,7 @@ def test_spawn_link_trap_while_receiving():
         yield System.send(addr, "hello")
         try:
             yield System.receive()
-        except ActorTerminated as ex:
+        except Signal.ActorTerminated as ex:
             assert ex.actor == addr
             assert ex.cause == NormalExit("done")
 
@@ -492,7 +487,7 @@ def test_sleep_interrupted_by_sigint():
     def sleeper(*args):
         try:
             yield System.sleep(60)
-        except ActorCancelled:
+        except Signal.INT:
             yield System.exit("interrupted")
 
     with curtain_call(max_idle=1) as theatre:
@@ -511,9 +506,8 @@ def test_sleep_interrupted_by_sigkill():
         addr = theatre.spawn(sleeper)
         time.sleep(0.05)
         theatre.kill(addr)
-        with pytest.raises(ActorSignaled) as exc:
+        with pytest.raises(Signal.KILL) as exc:
             theatre.spotlight(addr)
-        assert exc.value.signal is Signal.KILL
 
 
 def test_signal_all_interrupts_sleep():
@@ -522,13 +516,13 @@ def test_signal_all_interrupts_sleep():
     def sleeper(*args):
         try:
             yield System.sleep(60)
-        except ActorCancelled:
+        except Signal.INT:
             yield System.exit("interrupted")
 
     with curtain_call(max_idle=1) as theatre:
         addrs = [theatre.spawn(sleeper) for _ in range(N)]
         time.sleep(0.05)
-        theatre.signal_all(Signal.INT)
+        theatre.signal_all(Signal.INT())
         results = theatre.wait_ensemble()
         for addr, cause in results:
             if addr in addrs:
@@ -540,7 +534,7 @@ def test_receive_timeout_interrupted_by_sigint():
     def actor(*args):
         try:
             msg = yield System.receive(timeout=5)
-        except ActorCancelled:
+        except Signal.INT:
             yield System.exit("cancelled")
 
     with curtain_call(max_idle=1) as theatre:

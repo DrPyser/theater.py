@@ -127,8 +127,27 @@ class Signal(enum.Enum):
     INT = enum.auto()
     TERM = enum.auto()
 
+
+class _Signal(Exception):
     def __str__(self):
-        return f"SIG{self.name}"
+        return f"Signal.{type(self).__name__}"
+
+    def __postinit__(self, *args):
+        super().__init__(args)
+
+
+class Signal:
+    class KILL(_Signal): pass
+    class INT(_Signal): pass
+
+    @dataclass()
+    class MailboxFull(_Signal):
+        actor: ActorAddress
+
+    @dataclass()
+    class ActorTerminated(_Signal):
+        actor: ActorAddress
+        cause: Exit | _Signal
 
 
 class Event:
@@ -145,9 +164,10 @@ class Event:
     class EndOfScene(ActorEvent):
         future: Future
 
-    @dataclass
-    class MessageDelivered(ActorEvent):
-        pass
+    @dataclass(frozen=True)
+    class Message(ActorEvent):
+        message: Any
+        sender: ActorAddress
 
     @dataclass
     class ExternalRequest:
@@ -391,7 +411,6 @@ class StateMachine:
 
     def initiate(self, addr, play, stage):
         assert addr not in play.states
-        sheet = play.actors[addr]
         play.states[addr] = State.Init()
 
     def resume_with_value(self, addr, value, play, stage):
@@ -485,7 +504,7 @@ class StateMachine:
                     logger.debug(f"actor {addr} terminated with value {ex.value}")
                 except CancelledError as ex:
                     logger.debug(f"actor {addr} cancelled during init")
-                    wrap = ActorCancelled(addr)
+                    wrap = Signal.INT()
                     wrap.__cause__ = wrap.__context__ = ex
                     play.states[addr] = State.Terminated(cause=ErrorExit(wrap))
                 except Exception as ex:
@@ -636,40 +655,35 @@ class Theatre:
         )
         self._play.conditions.append(condition)
 
-    def _send(self, address: ActorAddress, message: Any):
-        if destination := self._play.actors.get(address):
-            match self._play.states.get(address):
-                case State.Terminated(cause=cause):
-                    raise ActorTerminated(address, cause)
-                case _:
-                    try:
-                        destination.mailbox.append(message)
-                    except MailboxFull as ex:
-                        raise
-                    else:
-                        self._events.put(Event.MessageDelivered(actor=address))
-                        return
-        else:
+    def _send(self, address: ActorAddress, message: Any, sender: ActorAddress):
+        if address not in self._play.actors:
             raise DestinationNotFound(address)
+        elif (destination_state := self._play.states.get(address)) and isinstance(destination_state, State.Terminated):
+            raise Signal.ActorTerminated(address, destination_state.cause)
+        else:
+            self._events.put(Event.Message(actor=address, message=message, sender=sender))
 
     def _handle_signal(self, actor: ActorAddress, signal: Signal):
-        sheet = self._play.actors[actor]
         state = self._play.states[actor]
         self._logger.debug(f"{signal} sent to actor {actor} in state {state}")
         match signal:
-            case Signal.KILL:
+            case Signal.MailboxFull():
+                self._sm.interrupt(actor, signal, self._play, self._stage)
+            case Signal.ActorTerminated():
+                self._sm.interrupt(actor, signal, self._play, self._stage)
+            case Signal.KILL():
                 match state:
                     case State.Terminated():
                         pass
                     case _:
                         self._sm.terminate(actor, signal, self._play)
-            case Signal.INT:
-                match self._play.states[actor]:
+            case Signal.INT():
+                match state:
                     case State.Terminated():
                         pass
                     case _:
                         self._sm.interrupt(
-                            actor, ActorCancelled(actor), self._play, self._stage
+                            actor, signal, self._play, self._stage
                         )
             case _:
                 raise NotImplementedError()
@@ -718,7 +732,7 @@ class Theatre:
                 f"actor({addr}) request {request} satisfied directly: {msg}"
             )
             return RequestResult.ResumeWithValue(msg)
-            
+
     def _handle_request(self, addr, request):
         self._logger.debug(f"handling request: actor({addr}), request({request})")
         sheet = self._play.actors[addr]
@@ -738,19 +752,19 @@ class Theatre:
                 return RequestResult.ResumeWithValue(addr)
             case System.send(dest_addr, msg):
                 try:
-                    self._send(dest_addr, msg)
+                    self._send(dest_addr, msg, addr)
                 except Exception as ex:
                     return RequestResult.ResumeWithError(ex)
                 else:
                     return RequestResult.ResumeWithValue(None)
-            case System.receive(filter=filter_fn, timeout=timeout):
+            case System.receive():
                 return self._receive(sheet, request)
             case System.sleep(n):
                 interrupt = threading.Event()
 
                 def delayed():
                     if interrupt.wait(timeout=n):
-                        raise ActorCancelled(addr)
+                        raise Signal.INT()
 
                 resp_future = self._stage.submit_request(
                     addr, request, delayed, interrupt=interrupt
@@ -774,7 +788,7 @@ class Theatre:
                     result_future.set_result(address)
                 case System.send(address, message):
                     try:
-                        self._send(address, message)
+                        self._send(address, message, ActorAddress(0,0,0))
                     except Exception as ex:
                         result_future.set_exception(ex)
                     else:
@@ -836,11 +850,20 @@ class Theatre:
                             f"Stale event: actor {actor} has unexpected state {state}"
                         )
 
-            case Event.MessageDelivered(actor=actor):
-                self._logger.debug(
-                    f"actor({actor}) mailbox now has {len(self._play.actors[actor].mailbox)} messages"
-                )
-                self._play.runnable.append(actor)
+            case Event.Message(actor=actor, message=message, sender=sender):
+                match self._play.states.get(actor):
+                    case State.Terminated(cause=cause):
+                        self._events.put(Event.Signal(sender, Signal.ActorTerminated(actor, cause)))
+                    case _:
+                        try:
+                            self._play.actors[actor].mailbox.append(message)
+                        except MailboxFull:
+                            self._events.put(Event.Signal(sender, Signal.MailboxFull(actor)))
+                        else:
+                            self._logger.debug(
+                                f"actor({actor}) mailbox now has {len(self._play.actors[actor].mailbox)} messages"
+                            )
+                            self._play.runnable.append(actor)
             case Event.RegisterCondition():
                 self._play.conditions.append(event)
             case Event.ExternalRequest(request, result_future):
@@ -867,7 +890,7 @@ class Theatre:
                     case _:
                         cause = future.result()
                         self._sm.interrupt(
-                            linker, ActorTerminated(linked, cause), self._play, self._stage
+                            linker, Signal.ActorTerminated(linked, cause), self._play, self._stage
                         )
                         self._play.runnable.append(linker)
             case Event.ReceiveTimeout(
@@ -878,7 +901,6 @@ class Theatre:
                     self._logger.debug(f"Unknown actor {actor}, ignoring")
                     return
                 state = self._play.states[actor]
-                sheet = self._play.actors[actor]
                 match state:
                     case State.Receiving(request=req, timeout_task=tfut):
                         assert future is tfut
@@ -1020,7 +1042,7 @@ class Theatre:
                         fut.set_exception(exception)
                     case _:
                         continue
-                        
+
             self._logger.debug("Aborting %d registered conditions", len(self._play.conditions))
             for condition in self._play.conditions:
                 if not condition.future.done():
@@ -1049,7 +1071,7 @@ class Theatre:
 
     def _create_task(self):
         fut = Future()
-        return fut 
+        return fut
 
     def _request(self, request):
         future = self._create_task()
@@ -1112,10 +1134,10 @@ class Theatre:
         match future.result():
             case NormalExit(value):
                 return value
+            case _Signal() as signal:
+                raise signal
             case ErrorExit(cause=error):
                 raise error
-            case Signal() as signal:
-                raise ActorSignaled(actor, signal)
 
     def census(self):
         future = self._create_task()
@@ -1132,10 +1154,10 @@ class Theatre:
         return future.result()
 
     def cancel(self, actor: ActorAddress):
-        self._events.put(Event.Signal(actor, Signal.INT))
+        self._events.put(Event.Signal(actor, Signal.INT()))
 
     def kill(self, actor: ActorAddress):
-        self._events.put(Event.Signal(actor, Signal.KILL))
+        self._events.put(Event.Signal(actor, Signal.KILL()))
 
     def signal(self, actor: ActorAddress, signal: Signal):
         self._events.put(Event.Signal(actor, signal))
@@ -1151,7 +1173,7 @@ class Theatre:
         self._logger.info("Tearing down the stage")
         if self._thread and self._thread.is_alive():
             self._logger.debug("Sending SIGINT to all actors")
-            self.signal_all(Signal.INT)
+            self.signal_all(Signal.INT())
             self._logger.debug("Stopping theatre's run loop")
             self._stop()
             self._logger.debug("Joining on run loop thread")
