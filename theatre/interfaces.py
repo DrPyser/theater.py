@@ -9,7 +9,7 @@ from typing import (
     Any,
     Iterable,
 )
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from contextvars import Context, ContextVar
 
 
@@ -41,6 +41,12 @@ class Exit(Exception):
 
 
 class System:
+    @dataclass
+    class call:
+        fn: Callable
+        args: tuple = ()
+        kwargs: dict = field(default_factory=dict)
+
     @dataclass
     class exit:
         value: Any = None

@@ -694,3 +694,31 @@ def test_census_live_actor_has_correct_state():
         assert info.mailbox_size == 0
         assert info.exit_cause is None
 
+
+def test_call():
+    def blocking_task():
+        time.sleep(0.05)
+        return 42
+
+    def waiter(*args):
+        res = yield System.call(blocking_task)
+        yield System.exit(res)
+
+    with curtain_call(max_idle=1) as theatre:
+        res = theatre.run(waiter)
+        assert res == 42
+
+
+def test_call_exception():
+    def blocking_task():
+        time.sleep(0.05)
+        raise Exception("Oops")
+
+    def waiter(*args):
+        res = yield System.call(blocking_task)
+        yield System.exit(res)
+
+    with curtain_call(max_idle=1) as theatre:
+        with pytest.raises(Exception):
+            theatre.run(waiter)
+

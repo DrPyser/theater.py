@@ -725,6 +725,9 @@ class Theatre:
         sheet = self._play.actors[addr]
 
         match request:
+            case System.call(fn, args, kwargs):
+                resp_future = self._stage.submit_request(addr, request, lambda: fn(*args, **kwargs))
+                return RequestResult.AwaitFuture(request, resp_future)
             case System.exit(value):
                 self._logger.debug(f"actor({addr}) terminated with value {value}")
                 return RequestResult.Terminate(NormalExit(value))
