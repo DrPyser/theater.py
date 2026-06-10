@@ -14,7 +14,14 @@
             buildInputs = with pkgs; [
               (python314.withPackages (ps: with ps; [ pip uv ty pytest ]))
               ruff
+              socat
             ];
+
+            shellHook = ''
+              if [ -d "$PWD/tests/bats/bin" ]; then
+                export PATH="$PWD/tests/bats/bin:$PATH"
+              fi
+            '';
           };
 
           # defaultPackage = with pkgs.poetry2nix; mkPoetryApplication {
