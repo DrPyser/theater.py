@@ -17,6 +17,8 @@ from theatre.threaded_theatre import (
     drain,
 )
 
+from theatre.context import whoami, get_logger, whoisparent
+
 
 def test_drain_empty_queue():
     q = queue.Queue()
@@ -253,7 +255,9 @@ def test_non_blocking_receive():
         yield System.send(w2, "world")
         yield System.exit("done")
 
-    with curtain_call(max_idle=1, executor=ThreadPoolExecutor(max_workers=1)) as theatre:
+    with curtain_call(
+        max_idle=1, executor=ThreadPoolExecutor(max_workers=1)
+    ) as theatre:
         result = theatre.run(sender)
         assert result == "done"
 
@@ -722,3 +726,45 @@ def test_call_exception():
         with pytest.raises(Exception):
             theatre.run(waiter)
 
+
+def test_get_self_from_context():
+    def amnesiac():
+        self = whoami()
+        yield System.exit(self)
+
+    with curtain_call(max_idle=1) as theatre:
+        addr = theatre.spawn(amnesiac)
+        result = theatre.spotlight(addr)
+        assert result == addr
+
+
+def test_log_from_context():
+    import logging
+    import io
+
+    def amnesiac():
+        logger = get_logger()
+        buffer = io.StringIO()
+        logger.addHandler(logging.StreamHandler(buffer))
+        logger.info("Logging from %s", whoami())
+        yield System.exit(buffer.getvalue())
+
+    with curtain_call(max_idle=1) as theatre:
+        addr = theatre.spawn(amnesiac)
+        result = theatre.spotlight(addr)
+        assert f"Logging from {addr}"
+
+
+def test_parent_from_context():
+    def child():
+        yield System.exit(whoisparent())
+
+    def parent():
+        child_addr = yield System.spawn(child)
+        yield System.exit(child_addr)
+
+    with curtain_call(max_idle=1) as theatre:
+        addr = theatre.spawn(parent)
+        child_addr = theatre.spotlight(addr)
+        result = theatre.spotlight(child_addr)
+        assert result == addr

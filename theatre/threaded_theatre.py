@@ -14,6 +14,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
 )
 from contextvars import copy_context
+from theatre.context import _SELF_ADDRESS, _LOGGER, _PARENT_ADDRESS
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -343,11 +344,12 @@ class Stage:
     events: queue.Queue
     logger: logging.Logger
 
-    def submit_performance(self, addr, fn, *args, interrupt=None):
+    def submit_performance(self, addr, fn, *args, interrupt=None, ctx=None):
         self.logger.debug(
             f"submitting performance for actor {addr}: {fn.__qualname__}{args!r}"
         )
-        fut = self.executor.submit(fn, *args)
+        _fn, _args = (ctx.run, (fn, *args)) if ctx else (fn, args)
+        fut = self.executor.submit(_fn, *_args)
         task = CancellableTask(future=fut, interrupt=interrupt)
         fut.add_done_callback(
             lambda f: self.events.put(Event.EndOfScene(actor=addr, future=task))
@@ -403,13 +405,17 @@ class StateMachine:
     def resume_with_value(self, addr, value, play, stage):
         assert not isinstance(play.states[addr], State.Executing)
         sheet = play.actors[addr]
-        future = stage.submit_performance(addr, sheet.performance.send, value)
+        future = stage.submit_performance(
+            addr, sheet.performance.send, value, ctx=sheet.context
+        )
         play.states[addr] = State.Executing(future=future)
 
     def resume_with_error(self, addr, exc, play, stage):
         assert not isinstance(play.states[addr], State.Executing)
         sheet = play.actors[addr]
-        future = stage.submit_performance(addr, sheet.performance.throw, exc)
+        future = stage.submit_performance(
+            addr, sheet.performance.throw, exc, ctx=sheet.context
+        )
         play.states[addr] = State.Executing(future=future)
 
     def interrupt(self, addr, exc, play, stage):
@@ -423,13 +429,15 @@ class StateMachine:
                     stage.logger.debug("actor(%s): dismissing request %s to signal interruption", addr, result)
                     return sheet.performance.throw(exc)
 
-                exec_future = stage.submit_performance(addr, exec_chain)
+                exec_future = stage.submit_performance(
+                    addr, exec_chain, ctx=sheet.context
+                )
                 play.states[addr] = State.Executing(future=exec_future)
             case _:
                 self.cancel_pending_task(addr, play)
                 if not isinstance(state, State.Terminated):
                     exec_future = stage.submit_performance(
-                        addr, sheet.performance.throw, exc
+                        addr, sheet.performance.throw, exc, ctx=sheet.context
                     )
                     play.states[addr] = State.Executing(future=exec_future)
 
@@ -467,17 +475,20 @@ class StateMachine:
                 if fut.cancelled():
                     logger.debug(f"actor({addr}) request({req}) cancelled")
                     exec_future = stage.submit_performance(
-                        addr, sheet.performance.throw, RequestCancelled(req)
+                        addr,
+                        sheet.performance.throw,
+                        RequestCancelled(req),
+                        ctx=sheet.context,
                     )
                 elif exception := fut.exception():
                     logger.debug(f"actor({addr}) request({req}) failed: {exception}")
                     exec_future = stage.submit_performance(
-                        addr, sheet.performance.throw, exception
+                        addr, sheet.performance.throw, exception, ctx=sheet.context
                     )
                 else:
                     logger.debug(f"actor({addr}) request({req}) succeeded")
                     exec_future = stage.submit_performance(
-                        addr, sheet.performance.send, fut.result()
+                        addr, sheet.performance.send, fut.result(), ctx=sheet.context
                     )
 
                 play.states[addr] = State.Executing(future=exec_future)
@@ -602,17 +613,28 @@ class Theatre:
         addr = ActorAddress(os.getpid(), id(self), id(performance))
         return addr
 
-    def _create_actor(self, script, props):
+    def _create_actor(self, script, props, parent=None):
         mailbox = Mailbox(maxlen=self.queue_size)
         actor_coro = script(*props)
         addr = self.make_addr(actor_coro)
+        # setup contextvars
+        context = copy_context()
+        context.run(_SELF_ADDRESS.set, addr)
+        context.run(_LOGGER.set, logger.getChild(f"actor.{addr}"))
+        if parent:
+            context.run(_PARENT_ADDRESS.set, parent)
+
+        logger.debug(
+            "initialized actor context: _SELF_ADDRESS=%s",
+            context.run(_SELF_ADDRESS.get),
+        )
         return ActorSheet(
             address=addr,
             script=script,
             props=props,
             performance=actor_coro,
             mailbox=mailbox,
-            context=copy_context(),
+            context=context,
         )
 
     def _link(self, owner: ActorAddress, target: ActorAddress):
@@ -732,11 +754,11 @@ class Theatre:
                 self._logger.debug(f"actor({addr}) terminated with value {value}")
                 return RequestResult.Terminate(NormalExit(value))
             case System.spawn_link(script, props):
-                child = self._spawn(script, props, play=self._play)
+                child = self._spawn(script, props, play=self._play, parent=addr)
                 self._link(addr, child)
                 return RequestResult.ResumeWithValue(child)
             case System.spawn(script, props):
-                child = self._spawn(script, props, play=self._play)
+                child = self._spawn(script, props, play=self._play, parent=addr)
                 return RequestResult.ResumeWithValue(child)
             case System.whoami():
                 return RequestResult.ResumeWithValue(addr)
@@ -774,7 +796,9 @@ class Theatre:
         try:
             match request:
                 case System.spawn(script, props):
-                    address = self._spawn(script=script, props=props)
+                    address = self._spawn(
+                        script=script, props=props, parent=ActorAddress(0, 0, 0)
+                    )
                     result_future.set_result(address)
                 case System.send(address, message):
                     try:
@@ -1052,10 +1076,10 @@ class Theatre:
         self._logger.info(f"Starting theatre's run loop thread {self._thread=}")
         self._thread.start()
 
-    def _spawn(self, script: Actor, props: tuple, play=None):
+    def _spawn(self, script: Actor, props: tuple, play=None, parent=None):
         logger.debug(f"Processing spawn request {script=} {props=}")
         play = play or self._play
-        sheet = self._create_actor(script, props)
+        sheet = self._create_actor(script, props, parent=parent)
         play.actors[sheet.address] = sheet
         return sheet.address
 
