@@ -121,6 +121,7 @@ ActorState = (
     | State.Terminated
 )
 
+
 @dataclass
 class NormalExit:
     value: Any
@@ -175,8 +176,11 @@ class _Signal(Exception):
 
 
 class Signal:
-    class KILL(_Signal): pass
-    class INT(_Signal): pass
+    class KILL(_Signal):
+        pass
+
+    class INT(_Signal):
+        pass
 
     @dataclass()
     class MailboxFull(_Signal):
@@ -249,6 +253,7 @@ class RequestResult:
     """
     request handling resolution state
     """
+
     @dataclass
     class Terminate:
         cause: Exit | Signal
@@ -378,10 +383,7 @@ class StateMachine:
             case State.Receiving(timeout_task=tfut):
                 if tfut:
                     tfut.cancel()
-            case (
-                State.Awaiting(response_future=future)
-                | State.Executing(future)
-            ):
+            case State.Awaiting(response_future=future) | State.Executing(future):
                 future.cancel()
             case _:
                 pass
@@ -424,9 +426,14 @@ class StateMachine:
         sheet = play.actors[addr]
         match state:
             case State.Executing(future=fut):
+
                 def exec_chain():
                     result = fut.result()
-                    stage.logger.debug("actor(%s): dismissing request %s to signal interruption", addr, result)
+                    stage.logger.debug(
+                        "actor(%s): dismissing request %s to signal interruption",
+                        addr,
+                        result,
+                    )
                     return sheet.performance.throw(exc)
 
                 exec_future = stage.submit_performance(
@@ -467,7 +474,9 @@ class StateMachine:
                     case RequestResult.ResumeWithError(exc):
                         self.resume_with_error(addr, exc, play, stage)
                     case result:
-                        raise RuntimeError(f"Unexpected request handling outcome: {result}")
+                        raise RuntimeError(
+                            f"Unexpected request handling outcome: {result}"
+                        )
                 return True
 
             case State.Awaiting(request=req, response_future=fut) if fut.done():
@@ -667,10 +676,14 @@ class Theatre:
     def _send(self, address: ActorAddress, message: Any, sender: ActorAddress):
         if address not in self._play.actors:
             raise DestinationNotFound(address)
-        elif (destination_state := self._play.states.get(address)) and isinstance(destination_state, State.Terminated):
+        elif (destination_state := self._play.states.get(address)) and isinstance(
+            destination_state, State.Terminated
+        ):
             raise Signal.ActorTerminated(address, destination_state.cause)
         else:
-            self._events.put(Event.Message(actor=address, message=message, sender=sender))
+            self._events.put(
+                Event.Message(actor=address, message=message, sender=sender)
+            )
 
     def _handle_signal(self, actor: ActorAddress, signal: Signal):
         state = self._play.states[actor]
@@ -691,9 +704,7 @@ class Theatre:
                     case State.Terminated():
                         pass
                     case _:
-                        self._sm.interrupt(
-                            actor, signal, self._play, self._stage
-                        )
+                        self._sm.interrupt(actor, signal, self._play, self._stage)
             case _:
                 raise NotImplementedError()
 
@@ -702,9 +713,7 @@ class Theatre:
         try:
             msg = actor.mailbox.pop_matching(request.filter)
         except _NoMatch:
-            self._logger.debug(
-                f"Parking actor({addr}) on receive request ({request})"
-            )
+            self._logger.debug(f"Parking actor({addr}) on receive request ({request})")
             timeout_task = None
             if request.timeout is not None:
                 self._logger.debug(
@@ -748,7 +757,9 @@ class Theatre:
 
         match request:
             case System.call(fn, args, kwargs):
-                resp_future = self._stage.submit_request(addr, request, lambda: fn(*args, **kwargs))
+                resp_future = self._stage.submit_request(
+                    addr, request, lambda: fn(*args, **kwargs)
+                )
                 return RequestResult.AwaitFuture(request, resp_future)
             case System.exit(value):
                 self._logger.debug(f"actor({addr}) terminated with value {value}")
@@ -802,7 +813,7 @@ class Theatre:
                     result_future.set_result(address)
                 case System.send(address, message):
                     try:
-                        self._send(address, message, ActorAddress(0,0,0))
+                        self._send(address, message, ActorAddress(0, 0, 0))
                     except Exception as ex:
                         result_future.set_exception(ex)
                     else:
@@ -867,12 +878,16 @@ class Theatre:
             case Event.Message(actor=actor, message=message, sender=sender):
                 match self._play.states.get(actor):
                     case State.Terminated(cause=cause):
-                        self._events.put(Event.Signal(sender, Signal.ActorTerminated(actor, cause)))
+                        self._events.put(
+                            Event.Signal(sender, Signal.ActorTerminated(actor, cause))
+                        )
                     case _:
                         try:
                             self._play.actors[actor].mailbox.append(message)
                         except MailboxFull:
-                            self._events.put(Event.Signal(sender, Signal.MailboxFull(actor)))
+                            self._events.put(
+                                Event.Signal(sender, Signal.MailboxFull(actor))
+                            )
                         else:
                             self._logger.debug(
                                 f"actor({actor}) mailbox now has {len(self._play.actors[actor].mailbox)} messages"
@@ -904,7 +919,10 @@ class Theatre:
                     case _:
                         cause = future.result()
                         self._sm.interrupt(
-                            linker, Signal.ActorTerminated(linked, cause), self._play, self._stage
+                            linker,
+                            Signal.ActorTerminated(linked, cause),
+                            self._play,
+                            self._stage,
                         )
                         self._play.runnable.append(linker)
             case Event.ReceiveTimeout(
@@ -975,8 +993,7 @@ class Theatre:
                 cnt = next(loop_count)
                 if self.max_idle and idle_count >= self.max_idle:
                     self._logger.debug(
-                        f"(%d) Reached max idle count ({self.max_idle=}), stopping",
-                        cnt
+                        f"(%d) Reached max idle count ({self.max_idle=}), stopping", cnt
                     )
                     stop_reason = "idle"
                     break
@@ -1005,29 +1022,39 @@ class Theatre:
                     self._logger.debug(f"Handled event {event}")
 
                 # now check for new actors ready to act
-                for newbie in tuple(actor for actor in self._play.actors if actor not in self._play.states):
+                for newbie in tuple(
+                    actor
+                    for actor in self._play.actors
+                    if actor not in self._play.states
+                ):
                     self._logger.debug("(%d) Kicking-off new actor %s", cnt, newbie)
                     self._sm.initiate(newbie, self._play, self._stage)
                     self._play.runnable.append(newbie)
 
                 # let actors play up to their steady state
                 while self._play.runnable:
-                    self._logger.debug("(%d) %d actors in runnable state", cnt, len(self._play.runnable))
+                    self._logger.debug(
+                        "(%d) %d actors in runnable state",
+                        cnt,
+                        len(self._play.runnable),
+                    )
                     addr = self._play.runnable.popleft()
                     if addr in self._play.states:
-                        if self._sm.process(addr, self._play, self._stage, self._handle_request):
+                        if self._sm.process(
+                            addr, self._play, self._stage, self._handle_request
+                        ):
                             self._play.runnable.append(addr)
 
                 self._process_conditions()
         except Event.Stop as ex:
             self._logger.info(
-                "(%d) Stop signal received, terminating event loop: %s",
-                cnt,
-                ex
+                "(%d) Stop signal received, terminating event loop: %s", cnt, ex
             )
             stop_reason = ("signal", ex)
         except BaseException as ex:
-            self._logger.exception("(%d) Theatre run loop raised exception: %s", cnt, ex)
+            self._logger.exception(
+                "(%d) Theatre run loop raised exception: %s", cnt, ex
+            )
             stop_reason = ("error", ex)
             raise
         finally:
@@ -1035,9 +1062,7 @@ class Theatre:
             match stop_reason:
                 case "idle":
                     assert self.max_idle and idle_count >= self.max_idle
-                    exception = (
-                        MaxIdleException(idle_count, self.max_idle)
-                    )
+                    exception = MaxIdleException(idle_count, self.max_idle)
                 case ("signal", event):
                     exception = event
                 case ("error", error):
@@ -1049,20 +1074,21 @@ class Theatre:
             events += list(drain(self._events, timeout=0.0))
             for event in events:
                 match event:
-                    case Event.RegisterCondition(future=fut) \
-                        | Event.ExternalRequest(result_future=fut) \
-                        if not fut.done():
+                    case (
+                        Event.RegisterCondition(future=fut)
+                        | Event.ExternalRequest(result_future=fut)
+                    ) if not fut.done():
                         self._logger.debug("Aborting future for event: %s", event)
                         fut.set_exception(exception)
                     case _:
                         continue
 
-            self._logger.debug("Aborting %d registered conditions", len(self._play.conditions))
+            self._logger.debug(
+                "Aborting %d registered conditions", len(self._play.conditions)
+            )
             for condition in self._play.conditions:
                 if not condition.future.done():
-                    condition.future.set_exception(
-                        exception
-                    )
+                    condition.future.set_exception(exception)
 
     def _stop(self):
         assert self._thread and self._thread.is_alive()
