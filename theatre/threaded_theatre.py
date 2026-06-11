@@ -355,7 +355,13 @@ class Stage:
         self.logger.debug(
             f"submitting performance for actor {addr}: {fn.__qualname__}{args!r}"
         )
-        _fn, _args = (ctx.run, (fn, *args)) if ctx else (fn, args)
+        def wrapper():
+            for var, value in ctx.items():
+                var.set(value)
+
+            return fn(*args)
+
+        _fn, _args = (wrapper,()) if ctx else (fn, args)
         fut = self.executor.submit(_fn, *_args)
         task = CancellableTask(future=fut, interrupt=interrupt)
         fut.add_done_callback(
