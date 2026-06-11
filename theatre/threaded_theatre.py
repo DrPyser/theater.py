@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from theatre.interfaces import Actor, ActorSheet, Address, System
+from theatre.utils import log_bind
+
 
 logger = logging.getLogger(__name__)
 
@@ -629,7 +631,7 @@ class Theatre:
         # setup contextvars
         context = copy_context()
         context.run(_SELF_ADDRESS.set, addr)
-        context.run(_LOGGER.set, logger.getChild(f"actor.{addr}"))
+        context.run(_LOGGER.set, log_bind(logger.getChild(f"actor.{addr}"), actor=addr))
         if parent:
             context.run(_PARENT_ADDRESS.set, parent)
 

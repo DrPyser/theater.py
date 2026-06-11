@@ -17,20 +17,6 @@ def get_peer_cred(conn: socket.socket):
     return pid, uid, gid
 
 
-def log_adapter(record_adapter):
-    class _LoggingAdapter(logging.LoggerAdapter):
-        def process(self, msg, kwargs):
-            return record_adapter(self.extra, msg, kwargs)
-
-    return _LoggingAdapter
-
-
-@log_adapter
-def contextual_adapter(ctx: dict, msg: str, kwargs: dict):
-    context = ctx | kwargs.pop("context", {})
-    attrs = " ".join(f"{key}={value}" for key, value in context.items())
-    return f"{msg} [{attrs}]", kwargs
-
 
 logger = contextual_adapter(logging.getLogger(__name__), {})
 
