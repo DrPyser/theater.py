@@ -186,6 +186,11 @@ class Signal:
         actor: ActorAddress
         cause: Exit | _Signal
 
+    @dataclass()
+    class Message(_Signal):
+        message: Any
+        sender: ActorAddress
+
 
 class Event:
     @dataclass(frozen=True)
@@ -200,11 +205,6 @@ class Event:
     @dataclass(frozen=True)
     class EndOfScene(ActorEvent):
         future: Future
-
-    @dataclass(frozen=True)
-    class Message(ActorEvent):
-        message: Any
-        sender: ActorAddress
 
     @dataclass(frozen=True)
     class ActorTerminated(ActorEvent):
@@ -660,13 +660,31 @@ class Theatre:
             raise Signal.ActorTerminated(address, destination_state.cause)
         else:
             self._events.put(
-                Event.Message(actor=address, message=message, sender=sender)
+                Event.Signal(actor=address, signal=Signal.Message(message=message, sender=sender))
             )
 
     def _handle_signal(self, actor: ActorAddress, signal: Signal):
         state = self._play.states[actor]
         self._logger.debug(f"{signal} sent to actor {actor} in state {state}")
         match signal:
+            case Signal.Message(message=message, sender=sender):
+                match state:
+                    case State.Terminated(cause=cause):
+                        self._events.put(
+                            Event.Signal(sender, Signal.ActorTerminated(actor, cause))
+                        )
+                    case _:
+                        try:
+                            self._play.actors[actor].mailbox.append(message)
+                        except MailboxFull:
+                            self._events.put(
+                                Event.Signal(sender, Signal.MailboxFull(actor))
+                            )
+                        else:
+                            self._logger.debug(
+                                f"actor({actor}) mailbox now has {len(self._play.actors[actor].mailbox)} messages"
+                            )
+                            self._play.runnable.append(actor)
             case Signal.MailboxFull():
                 self._sm.interrupt(actor, signal, self._play, self._stage)
             case Signal.ActorTerminated():
@@ -853,24 +871,6 @@ class Theatre:
                             f"Stale event: actor {actor} has unexpected state {state}"
                         )
 
-            case Event.Message(actor=actor, message=message, sender=sender):
-                match self._play.states.get(actor):
-                    case State.Terminated(cause=cause):
-                        self._events.put(
-                            Event.Signal(sender, Signal.ActorTerminated(actor, cause))
-                        )
-                    case _:
-                        try:
-                            self._play.actors[actor].mailbox.append(message)
-                        except MailboxFull:
-                            self._events.put(
-                                Event.Signal(sender, Signal.MailboxFull(actor))
-                            )
-                        else:
-                            self._logger.debug(
-                                f"actor({actor}) mailbox now has {len(self._play.actors[actor].mailbox)} messages"
-                            )
-                            self._play.runnable.append(actor)
             case Event.RegisterCondition():
                 self._play.conditions.append(event)
             case Event.ExternalRequest(request, result_future):
