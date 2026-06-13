@@ -82,12 +82,6 @@ class State:
         """Actor freshly minted"""
 
     @dataclass(frozen=True)
-    class Waiting:
-        """Actor yielded a request, not yet dispatched"""
-
-        request: object
-
-    @dataclass(frozen=True)
     class Awaiting:
         """Request dispatched, waiting for response_future to complete"""
 
@@ -116,7 +110,6 @@ class State:
 
 ActorState = (
     State.Init
-    | State.Waiting
     | State.Awaiting
     | State.Executing
     | State.Receiving
@@ -401,11 +394,11 @@ class StateMachine:
         play.states[addr] = State.Terminated(cause=cause)
 
     def await_future(self, addr, request, future, play):
-        assert isinstance(play.states[addr], State.Waiting)
+        assert isinstance(play.states[addr], State.Executing)
         play.states[addr] = State.Awaiting(request=request, response_future=future)
 
     def park(self, addr, request, timeout_task, play):
-        assert isinstance(play.states[addr], State.Waiting)
+        assert isinstance(play.states[addr], State.Executing)
         play.states[addr] = State.Receiving(request=request, timeout_task=timeout_task)
 
     def initiate(self, addr, play, stage):
@@ -413,7 +406,7 @@ class StateMachine:
         play.states[addr] = State.Init()
 
     def resume_with_value(self, addr, value, play, stage):
-        assert not isinstance(play.states[addr], State.Executing)
+        assert not isinstance(play.states[addr], State.Executing) or play.states[addr].future.done()
         sheet = play.actors[addr]
         future = stage.submit_performance(
             addr, sheet.performance.send, value, ctx=sheet.context
@@ -421,7 +414,7 @@ class StateMachine:
         play.states[addr] = State.Executing(future=future)
 
     def resume_with_error(self, addr, exc, play, stage):
-        assert not isinstance(play.states[addr], State.Executing)
+        assert not isinstance(play.states[addr], State.Executing) or play.states[addr].future.done()
         sheet = play.actors[addr]
         future = stage.submit_performance(
             addr, sheet.performance.throw, exc, ctx=sheet.context
@@ -468,25 +461,6 @@ class StateMachine:
             case State.Init():
                 self.resume_with_value(addr, None, play, stage)
                 return True
-
-            case State.Waiting(request=req):
-                match request_handler(addr, req):
-                    case RequestResult.Terminate(cause):
-                        self.terminate(addr, cause, play)
-                    case RequestResult.AwaitFuture(request, future):
-                        self.await_future(addr, request, future, play)
-                    case RequestResult.Park(request, timeout_task):
-                        self.park(addr, request, timeout_task, play)
-                    case RequestResult.ResumeWithValue(value):
-                        self.resume_with_value(addr, value, play, stage)
-                    case RequestResult.ResumeWithError(exc):
-                        self.resume_with_error(addr, exc, play, stage)
-                    case result:
-                        raise RuntimeError(
-                            f"Unexpected request handling outcome: {result}"
-                        )
-                return True
-
             case State.Awaiting(request=req, response_future=fut) if fut.done():
                 logger.debug(f"actor({addr}) request({req}) response ready")
                 if fut.cancelled():
@@ -526,8 +500,22 @@ class StateMachine:
                     play.states[addr] = State.Terminated(cause=ErrorExit(ex))
                     logger.debug(f"actor {addr} died: {ex}")
                 else:
-                    play.states[addr] = State.Waiting(request=req)
                     logger.debug(f"actor {addr} now pending request {req}")
+                    match request_handler(addr, req):
+                        case RequestResult.Terminate(cause):
+                            self.terminate(addr, cause, play)
+                        case RequestResult.AwaitFuture(request, future):
+                            self.await_future(addr, request, future, play)
+                        case RequestResult.Park(request, timeout_task):
+                            self.park(addr, request, timeout_task, play)
+                        case RequestResult.ResumeWithValue(value):
+                            self.resume_with_value(addr, value, play, stage)
+                        case RequestResult.ResumeWithError(exc):
+                            self.resume_with_error(addr, exc, play, stage)
+                        case result:
+                            raise RuntimeError(
+                                f"Unexpected request handling outcome: {result}"
+                            )
                 return True
 
             case State.Executing(future=fut):
