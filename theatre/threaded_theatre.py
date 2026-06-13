@@ -5,7 +5,7 @@ import logging
 import os
 import queue
 import threading
-from collections import deque
+from collections import deque, defaultdict
 from collections.abc import Callable, Iterator
 from concurrent.futures import (
     CancelledError,
@@ -207,6 +207,10 @@ class Event:
         sender: ActorAddress
 
     @dataclass(frozen=True)
+    class ActorTerminated(ActorEvent):
+        cause: Exit | _Signal
+
+    @dataclass(frozen=True)
     class ExternalRequest:
         request: Any
         result_future: Future
@@ -230,12 +234,6 @@ class Event:
     @dataclass(frozen=True)
     class SignalAll:
         signal: Signal
-
-    @dataclass(frozen=True)
-    class LinkTrap:
-        linker: ActorAddress
-        linked: ActorAddress
-        future: Future
 
     @dataclass(frozen=True)
     class ReceiveTimeout:
@@ -336,6 +334,7 @@ class Play:
     actors: dict[ActorAddress, ActorSheet]
     conditions: list[Event.RegisterCondition] = field(default_factory=list)
     runnable: deque[ActorAddress] = field(default_factory=deque)
+    links: dict[ActorAddress, set[ActorAddress]] = field(default_factory=lambda: defaultdict(set))
 
 
 @dataclass
@@ -389,9 +388,12 @@ class StateMachine:
             case _:
                 pass
 
-    def terminate(self, addr, cause, play):
+    def terminate(self, addr: ActorAddress, cause: Exit | _Signal, play: Play, stage: Stage):
         self.cancel_pending_task(addr, play)
         play.states[addr] = State.Terminated(cause=cause)
+        stage.events.put(
+            Event.ActorTerminated(addr, cause)
+        )
 
     def await_future(self, addr, request, future, play):
         assert isinstance(play.states[addr], State.Executing)
@@ -489,21 +491,21 @@ class StateMachine:
                 try:
                     req = fut.result()
                 except StopIteration as ex:
-                    play.states[addr] = State.Terminated(cause=NormalExit(ex.value))
+                    self.terminate(addr, NormalExit(ex.value), play, stage)
                     logger.debug(f"actor {addr} terminated with value {ex.value}")
                 except CancelledError as ex:
                     logger.debug(f"actor {addr} cancelled during init")
                     wrap = Signal.INT()
                     wrap.__cause__ = wrap.__context__ = ex
-                    play.states[addr] = State.Terminated(cause=ErrorExit(wrap))
+                    self.terminate(addr, ErrorExit(wrap), play, stage)
                 except Exception as ex:
-                    play.states[addr] = State.Terminated(cause=ErrorExit(ex))
+                    self.terminate(addr, ErrorExit(ex), play, stage)
                     logger.debug(f"actor {addr} died: {ex}")
                 else:
                     logger.debug(f"actor {addr} now pending request {req}")
                     match request_handler(addr, req):
                         case RequestResult.Terminate(cause):
-                            self.terminate(addr, cause, play)
+                            self.terminate(addr, cause, play, stage)
                         case RequestResult.AwaitFuture(request, future):
                             self.await_future(addr, request, future, play)
                         case RequestResult.Park(request, timeout_task):
@@ -645,29 +647,9 @@ class Theatre:
     def _link(self, owner: ActorAddress, target: ActorAddress):
         # register link callback
         self._logger.debug(
-            f"registering link condition: owner({owner}) <- target({target})"
+            f"registering link: owner({owner}) <- target({target})"
         )
-        future = Future()
-
-        def get_termination_cause(play):
-            return play.states[target].cause
-
-        def link_callback(fut: Future):
-            self._logger.debug(
-                f"link trap callback: signaling link trap event owner({owner}) <- target({target})"
-            )
-            self._events.put(Event.LinkTrap(linker=owner, linked=target, future=fut))
-
-        future.add_done_callback(link_callback)
-        condition = Event.RegisterCondition(
-            predicate=lambda play: (
-                target in play.states
-                and isinstance(play.states[target], State.Terminated)
-            ),
-            projection=get_termination_cause,
-            future=future,
-        )
-        self._play.conditions.append(condition)
+        self._play.links[target].add(owner)
 
     def _send(self, address: ActorAddress, message: Any, sender: ActorAddress):
         if address not in self._play.actors:
@@ -694,7 +676,7 @@ class Theatre:
                     case State.Terminated():
                         pass
                     case _:
-                        self._sm.terminate(actor, signal, self._play)
+                        self._sm.terminate(actor, signal, self._play, self._stage)
             case Signal.INT():
                 match state:
                     case State.Terminated():
@@ -902,25 +884,11 @@ class Theatre:
                     if not isinstance(self._play.states[actor], State.Terminated):
                         self._handle_signal(actor, signal)
                         self._play.runnable.append(actor)
-            case Event.LinkTrap(linker, linked, future):
-                linker_state = self._play.states[linker]
-                self._logger.debug(
-                    f"handling link trap: target({linked}) -> owner({linker}, state={linker_state})"
-                )
-                match linker_state:
-                    case State.Terminated():
-                        self._logger.debug(
-                            f"Link owner {linker} terminated before handling link trap for target {linked}"
-                        )
-                    case _:
-                        cause = future.result()
-                        self._sm.interrupt(
-                            linker,
-                            Signal.ActorTerminated(linked, cause),
-                            self._play,
-                            self._stage,
-                        )
-                        self._play.runnable.append(linker)
+            case Event.ActorTerminated(actor, cause):
+                for linked in self._play.links[actor]:
+                    self._events.put(
+                        Event.Signal(linked, Signal.ActorTerminated(actor, cause))
+                    )
             case Event.ReceiveTimeout(
                 actor=actor, request=request, timeout_task=future
             ):
