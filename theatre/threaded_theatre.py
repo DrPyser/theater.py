@@ -6,19 +6,19 @@ import os
 import queue
 import threading
 from collections import deque, defaultdict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Coroutine
 from concurrent.futures import (
     CancelledError,
     Executor,
     Future,
     ThreadPoolExecutor,
 )
-from contextvars import copy_context
+from contextvars import copy_context, Context
 from theatre.context import _SELF_ADDRESS, _LOGGER, _PARENT_ADDRESS
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Generic
 
-from theatre.interfaces import Actor, ActorSheet, Address, System
+from theatre.interfaces import Actor, Address, System, Script, PropsT
 from theatre.utils import log_bind
 
 
@@ -76,6 +76,16 @@ class ActorAddress(Address, tuple):
         return "ActorAddress({})".format(", ".join(map(str, self)))
 
 
+@dataclass
+class ActorSheet(Generic[PropsT]):
+    address: ActorAddress
+    script: Script[PropsT]
+    performance: Coroutine
+    props: PropsT
+    mailbox: Mailbox
+    context: Context
+
+
 class State:
     @dataclass(frozen=True)
     class Init:
@@ -98,7 +108,7 @@ class State:
     class Terminated:
         """Actor finished execution"""
 
-        cause: Exit | Signal
+        cause: Exit | _Signal
 
     @dataclass(frozen=True)
     class Receiving:
@@ -109,11 +119,7 @@ class State:
 
 
 ActorState = (
-    State.Init
-    | State.Awaiting
-    | State.Executing
-    | State.Receiving
-    | State.Terminated
+    State.Init | State.Awaiting | State.Executing | State.Receiving | State.Terminated
 )
 
 
@@ -149,7 +155,7 @@ class ReceiveTimeout(Exception):
 
 
 class ActorSignaled(Exception):
-    def __init__(self, actor: ActorAddress, signal: Signal):
+    def __init__(self, actor: ActorAddress, signal: _Signal):
         self.actor = actor
         self.signal = signal
 
@@ -200,11 +206,11 @@ class Event:
     @dataclass(frozen=True)
     class RequestCompleted(ActorEvent):
         request: Any
-        future: Future
+        future: CancellableTask
 
     @dataclass(frozen=True)
     class EndOfScene(ActorEvent):
-        future: Future
+        future: CancellableTask
 
     @dataclass(frozen=True)
     class ActorTerminated(ActorEvent):
@@ -229,11 +235,11 @@ class Event:
     @dataclass(frozen=True)
     class Signal:
         actor: ActorAddress
-        signal: Signal
+        signal: _Signal
 
     @dataclass(frozen=True)
     class SignalAll:
-        signal: Signal
+        signal: _Signal
 
     @dataclass(frozen=True)
     class ReceiveTimeout:
@@ -334,7 +340,9 @@ class Play:
     actors: dict[ActorAddress, ActorSheet]
     conditions: list[Event.RegisterCondition] = field(default_factory=list)
     runnable: deque[ActorAddress] = field(default_factory=deque)
-    links: dict[ActorAddress, set[ActorAddress]] = field(default_factory=lambda: defaultdict(set))
+    links: dict[ActorAddress, set[ActorAddress]] = field(
+        default_factory=lambda: defaultdict(set)
+    )
 
 
 @dataclass
@@ -347,17 +355,19 @@ class Stage:
         self.logger.debug(
             f"submitting performance for actor {addr}: {fn.__qualname__}{args!r}"
         )
+
         def wrapper():
+            assert ctx
             for var, value in ctx.items():
                 var.set(value)
 
             return fn(*args)
 
-        _fn, _args = (wrapper,()) if ctx else (fn, args)
+        _fn, _args = (wrapper, ()) if ctx else (fn, args)
         fut = self.executor.submit(_fn, *_args)
         task = CancellableTask(future=fut, interrupt=interrupt)
         fut.add_done_callback(
-            lambda f: self.events.put(Event.EndOfScene(actor=addr, future=task))
+            lambda _f: self.events.put(Event.EndOfScene(actor=addr, future=task))
         )
         return task
 
@@ -368,7 +378,7 @@ class Stage:
         fut = self.executor.submit(fn, *args)
         task = CancellableTask(future=fut, interrupt=interrupt)
         fut.add_done_callback(
-            lambda f: self.events.put(
+            lambda _f: self.events.put(
                 Event.RequestCompleted(actor=addr, request=request, future=task)
             )
         )
@@ -383,17 +393,19 @@ class StateMachine:
             case State.Receiving(timeout_task=tfut):
                 if tfut:
                     tfut.cancel()
-            case State.Awaiting(response_future=future) | State.Executing(future):
+            case (
+                State.Awaiting(response_future=future) | State.Executing(future=future)
+            ):
                 future.cancel()
             case _:
                 pass
 
-    def terminate(self, addr: ActorAddress, cause: Exit | _Signal, play: Play, stage: Stage):
+    def terminate(
+        self, addr: ActorAddress, cause: Exit | _Signal, play: Play, stage: Stage
+    ):
         self.cancel_pending_task(addr, play)
         play.states[addr] = State.Terminated(cause=cause)
-        stage.events.put(
-            Event.ActorTerminated(addr, cause)
-        )
+        stage.events.put(Event.ActorTerminated(addr, cause))
 
     def await_future(self, addr, request, future, play):
         assert isinstance(play.states[addr], State.Executing)
@@ -403,12 +415,15 @@ class StateMachine:
         assert isinstance(play.states[addr], State.Executing)
         play.states[addr] = State.Receiving(request=request, timeout_task=timeout_task)
 
-    def initiate(self, addr, play, stage):
+    def initiate(self, addr, play):
         assert addr not in play.states
         play.states[addr] = State.Init()
 
     def resume_with_value(self, addr, value, play, stage):
-        assert not isinstance(play.states[addr], State.Executing) or play.states[addr].future.done()
+        assert (
+            not isinstance(play.states[addr], State.Executing)
+            or play.states[addr].future.done()
+        )
         sheet = play.actors[addr]
         future = stage.submit_performance(
             addr, sheet.performance.send, value, ctx=sheet.context
@@ -416,7 +431,10 @@ class StateMachine:
         play.states[addr] = State.Executing(future=future)
 
     def resume_with_error(self, addr, exc, play, stage):
-        assert not isinstance(play.states[addr], State.Executing) or play.states[addr].future.done()
+        assert (
+            not isinstance(play.states[addr], State.Executing)
+            or play.states[addr].future.done()
+        )
         sheet = play.actors[addr]
         future = stage.submit_performance(
             addr, sheet.performance.throw, exc, ctx=sheet.context
@@ -524,7 +542,7 @@ class StateMachine:
                 logger.debug(f"actor({addr}) still executing (future {fut})")
                 return False
 
-            case State.Receiving(request=request, timeout_task=tfut):
+            case State.Receiving(request=_request, timeout_task=tfut):
                 assert not tfut or not tfut.cancelled(), (
                     "Receiving state should not be observed with cancelled timeout"
                 )
@@ -546,6 +564,8 @@ class StateMachine:
                         logger.debug(f"actor {addr} terminated with value {value}")
                     case Signal():
                         logger.debug(f"actor({addr}) terminated with signal {cause}")
+                return False
+            case _:
                 return False
 
     def _try_receive(self, addr, play, stage):
@@ -579,7 +599,7 @@ class ActorInfo:
     props: Any
     state_name: str
     mailbox_size: int = 0
-    exit_cause: Exit | Signal | None = None
+    exit_cause: Exit | _Signal | None = None
 
     @classmethod
     def from_run_state(cls, sheet: ActorSheet, state: ActorState) -> ActorInfo:
@@ -666,6 +686,7 @@ class Theatre:
                 pass
 
     def _send(self, address: ActorAddress, message: Any, sender: ActorAddress):
+        assert self._play
         if address not in self._play.actors:
             raise DestinationNotFound(address)
         elif (destination_state := self._play.states.get(address)) and isinstance(
@@ -674,10 +695,13 @@ class Theatre:
             raise Signal.ActorTerminated(address, destination_state.cause)
         else:
             self._events.put(
-                Event.Signal(actor=address, signal=Signal.Message(message=message, sender=sender))
+                Event.Signal(
+                    actor=address, signal=Signal.Message(message=message, sender=sender)
+                )
             )
 
-    def _handle_signal(self, actor: ActorAddress, signal: Signal):
+    def _handle_signal(self, actor: ActorAddress, signal: _Signal):
+        assert self._play
         state = self._play.states[actor]
         self._logger.debug(f"{signal} sent to actor {actor} in state {state}")
         match signal:
@@ -762,6 +786,7 @@ class Theatre:
             return RequestResult.ResumeWithValue(msg)
 
     def _handle_request(self, addr, request):
+        assert self._play
         self._logger.debug(f"handling request: actor({addr}), request({request})")
         sheet = self._play.actors[addr]
 
@@ -775,11 +800,11 @@ class Theatre:
                 self._logger.debug(f"actor({addr}) terminated with value {value}")
                 return RequestResult.Terminate(NormalExit(value))
             case System.spawn_link(script, props):
-                child = self._spawn(script, props, play=self._play, parent=addr)
+                child = self._spawn(script, props, parent=addr)
                 self._link(addr, child)
                 return RequestResult.ResumeWithValue(child)
             case System.spawn(script, props):
-                child = self._spawn(script, props, play=self._play, parent=addr)
+                child = self._spawn(script, props, parent=addr)
                 return RequestResult.ResumeWithValue(child)
             case System.whoami():
                 return RequestResult.ResumeWithValue(addr)
@@ -836,6 +861,7 @@ class Theatre:
             raise
 
     def _handle_event(self, event: Event) -> None:
+        assert self._play
         self._logger.debug(f"Handling event {event=}")
         match event:
             case Event.Stop():
@@ -930,6 +956,7 @@ class Theatre:
                 self._logger.debug(f"Unknown event {event=}")
 
     def _process_conditions(self):
+        assert self._play
         triggered_conditions = []
         for condition in self._play.conditions:
             try:
@@ -959,14 +986,13 @@ class Theatre:
             self._play.conditions.remove(condition)
 
     def _run_loop(self):
+        assert self._play
         stop_reason = None
         loop_count = itertools.count()
         idle_count = 0
         cnt = 0
         events = []
         try:
-            assert self._play
-
             while not stop_reason:
                 cnt = next(loop_count)
                 if self.max_idle and idle_count >= self.max_idle:
@@ -1006,7 +1032,7 @@ class Theatre:
                     if actor not in self._play.states
                 ):
                     self._logger.debug("(%d) Kicking-off new actor %s", cnt, newbie)
-                    self._sm.initiate(newbie, self._play, self._stage)
+                    self._sm.initiate(newbie, self._play)
                     self._play.runnable.append(newbie)
 
                 # let actors play up to their steady state
@@ -1080,11 +1106,11 @@ class Theatre:
         self._logger.info(f"Starting theatre's run loop thread {self._thread=}")
         self._thread.start()
 
-    def _spawn(self, script: Actor, props: tuple, play=None, parent=None):
+    def _spawn(self, script: Actor, props: tuple, parent=None):
+        assert self._play
         logger.debug(f"Processing spawn request {script=} {props=}")
-        play = play or self._play
         sheet = self._create_actor(script, props, parent=parent)
-        play.actors[sheet.address] = sheet
+        self._play.actors[sheet.address] = sheet
         return sheet.address
 
     def _create_task(self):
@@ -1097,7 +1123,7 @@ class Theatre:
         return future
 
     def spawn(self, script, *props):
-        assert self._thread.is_alive()
+        assert self._thread and self._thread.is_alive()
         future = self._request(
             System.spawn(
                 script=script,
@@ -1161,7 +1187,7 @@ class Theatre:
         future = self._create_task()
         self._events.put(
             Event.RegisterCondition(
-                predicate=lambda play: True,
+                predicate=lambda _play: True,
                 projection=lambda play: [
                     ActorInfo.from_run_state(play.actors[addr], play.states[addr])
                     for addr in play.actors
@@ -1177,17 +1203,17 @@ class Theatre:
     def kill(self, actor: ActorAddress):
         self._events.put(Event.Signal(actor, Signal.KILL()))
 
-    def signal(self, actor: ActorAddress, signal: Signal):
+    def signal(self, actor: ActorAddress, signal: _Signal):
         self._events.put(Event.Signal(actor, signal))
 
-    def signal_all(self, signal: Signal):
+    def signal_all(self, signal: _Signal):
         self._events.put(Event.SignalAll(signal))
 
     def __enter__(self):
         self._start()
         return self
 
-    def __exit__(self, exc, typ, tb):
+    def __exit__(self, exc, _typ, _tb):
         self._logger.info("Tearing down the stage")
         if self._thread and self._thread.is_alive():
             self._logger.debug("Sending SIGINT to all actors")

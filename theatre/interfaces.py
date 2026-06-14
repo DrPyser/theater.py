@@ -1,16 +1,18 @@
 from typing import (
     Protocol,
     TypeVar,
+    Generic,
+    Any,
+)
+from collections.abc import (
     Hashable,
     Callable,
-    Generic,
     Coroutine,
     Generator,
-    Any,
     Iterable,
 )
 from dataclasses import dataclass, field
-from contextvars import Context, ContextVar
+from contextvars import ContextVar
 
 
 class Address(Hashable, Protocol):
@@ -28,7 +30,7 @@ class Mailbox(Iterable, Protocol):
     def pop_matching(self, filter_fn: Callable[[Any], bool] | None = None) -> Any: ...
 
 
-PropsT = TypeVar("PropsT")
+PropsT = TypeVar("PropsT", bound=tuple)
 Script = Callable[[PropsT], Coroutine]
 SignalT = TypeVar("SignalT")
 T = TypeVar("T")
@@ -74,18 +76,18 @@ class System:
         predicates: list[Callable[[T], bool]]
 
     @dataclass
-    class spawn(Generic[PropsT]):
+    class spawn:
         script: Script
-        props: PropsT = ()
+        props: tuple = ()
 
     @dataclass
     class link:
         target: Address
 
     @dataclass
-    class spawn_link(Generic[PropsT]):
+    class spawn_link:
         script: Script
-        props: PropsT = ()
+        props: tuple = ()
 
     @dataclass
     class kill:
@@ -114,13 +116,3 @@ class Theater(Protocol):
 class ActorContext:
     addr: ContextVar[Address] = ContextVar("addr")
     parent_addr: ContextVar[Address] = ContextVar("parent_addr")
-
-
-@dataclass
-class ActorSheet(Generic[PropsT]):
-    address: Address
-    script: Script[PropsT]
-    performance: Coroutine
-    props: PropsT
-    mailbox: Mailbox
-    context: Context
