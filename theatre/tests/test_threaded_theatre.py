@@ -6,8 +6,10 @@ from concurrent.futures import Future, ThreadPoolExecutor
 
 import pytest
 
+from theatre.context import get_logger, whoami, whoisparent
 from theatre.interfaces import System
 from theatre.threaded_theatre import (
+    ErrorExit,
     NormalExit,
     ReceiveTimeout,
     Signal,
@@ -16,8 +18,6 @@ from theatre.threaded_theatre import (
     curtain_call,
     drain,
 )
-
-from theatre.context import whoami, get_logger, whoisparent
 
 
 def test_drain_empty_queue():

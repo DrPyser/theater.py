@@ -5,22 +5,21 @@ import logging
 import os
 import queue
 import threading
-from collections import deque, defaultdict
-from collections.abc import Callable, Iterator, Coroutine
+from collections import defaultdict, deque
+from collections.abc import Callable, Coroutine, Iterator
 from concurrent.futures import (
     CancelledError,
     Executor,
     Future,
     ThreadPoolExecutor,
 )
-from contextvars import copy_context, Context
-from theatre.context import _SELF_ADDRESS, _LOGGER, _PARENT_ADDRESS
+from contextvars import Context, copy_context
 from dataclasses import dataclass, field
 from typing import Any, Generic
 
-from theatre.interfaces import Actor, Address, System, Script, PropsT
+from theatre.context import _LOGGER, _PARENT_ADDRESS, _SELF_ADDRESS
+from theatre.interfaces import Actor, Address, PropsT, Script, System
 from theatre.utils import log_bind
-
 
 logger = logging.getLogger(__name__)
 

@@ -1,18 +1,18 @@
-from typing import (
-    Protocol,
-    TypeVar,
-    Generic,
-    Any,
-)
 from collections.abc import (
-    Hashable,
     Callable,
     Coroutine,
     Generator,
+    Hashable,
     Iterable,
 )
-from dataclasses import dataclass, field
 from contextvars import ContextVar
+from dataclasses import dataclass, field
+from typing import (
+    Any,
+    Generic,
+    Protocol,
+    TypeVar,
+)
 
 
 class Address(Hashable, Protocol):
