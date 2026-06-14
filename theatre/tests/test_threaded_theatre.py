@@ -768,3 +768,22 @@ def test_parent_from_context():
         child_addr = theatre.spotlight(addr)
         result = theatre.spotlight(child_addr)
         assert result == addr
+
+def test_multiple_links():
+    def linkee():
+        yield System.exit("buh-bye")
+
+    def linker(target):
+        yield System.link(target)
+        yield System.receive()
+
+    with curtain_call(max_idle=3) as theatre:
+        linkee_addr = theatre.spawn(linkee)
+        for i in range(3):
+            linker_addr = theatre.spawn(linker, linkee_addr)
+        for addr, exit in theatre.wait_ensemble():
+            if addr != linkee_addr:
+                assert isinstance(exit, ErrorExit)
+                assert isinstance(exit.cause, Signal.ActorTerminated)
+                assert exit.cause.actor == linkee_addr
+

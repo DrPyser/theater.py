@@ -645,11 +645,25 @@ class Theatre:
         )
 
     def _link(self, owner: ActorAddress, target: ActorAddress):
+        assert self._play
         # register link callback
-        self._logger.debug(
-            f"registering link: owner({owner}) <- target({target})"
-        )
+        self._logger.debug(f"registering link: owner({owner}) <- target({target})")
         self._play.links[target].add(owner)
+        match self._play.states.get(target):
+            case State.Terminated(cause):
+                self._logger.debug(
+                    "link target %s already terminated; signaling linker %s now",
+                    target,
+                    owner,
+                )
+                self._events.put(
+                    Event.Signal(
+                        actor=owner,
+                        signal=Signal.ActorTerminated(actor=target, cause=cause),
+                    )
+                )
+            case _:
+                pass
 
     def _send(self, address: ActorAddress, message: Any, sender: ActorAddress):
         if address not in self._play.actors:
